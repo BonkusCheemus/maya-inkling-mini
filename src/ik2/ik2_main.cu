@@ -109,6 +109,7 @@ static inline cudaError_t cudaMemAdvise_compat(const void* devPtr, size_t count,
 #include <random>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -261,13 +262,22 @@ struct Layer {
     uint16_t *kc = nullptr, *vc = nullptr;         // FP16 [kv_cap][KV * D] (IK2_KV=f16)
     uint8_t *kc8 = nullptr, *vc8 = nullptr;        // FP8 E4M3 [kv_cap][KV * D] (IK2_KV=fp8)
     int kv_cap = 0;
+    const int* page_table = nullptr;               // device [g_kv_max_pages] for paged global KV (null if unpaged/sliding)
     float *h_k, *h_v, *h_attn, *h_mlp;             // conv histories [3][C']
     float *rec_old[4] = {}, *rec_x[4] = {};        // (speculative) the convs' histories and inputs of a verify window
 };
 
+// Multi-slot serving (--parallel N): global visits share a paged KV pool (kKvPageSize = 256 positions/page),
+// while sliding visits and conv histories are contiguous [g_parallel][...] per slot.
+constexpr int kMaxParallel = 8;
+int g_parallel = 1;
+int g_kv_total_pages = 0;       // physical pages in shared global KV pool (0 when g_parallel == 1)
+int g_kv_max_pages = 0;         // max logical pages per slot
+int* g_kv_pt_d = nullptr;       // device [g_parallel][g_kv_max_pages] page tables (null when g_parallel == 1)
+
 // A layer visit and its own state.  Without a loop a visit is a layer; a looped core's layer is visited once a pass,
 // each time with that visit's K / V cache and conv histories (the weights, and the experts in the cache, are the
-// layer's).  bind_visit() points the layer's state at a visit's before it runs.
+// layer's).  bind_visit() points the layer's state at a visit's (and slot's) before it runs.
 struct Visit {
     int l = 0;        // the layer
     int pass = 0;     // the core's pass (0: its first, or a layer outside the core)
@@ -289,11 +299,21 @@ struct Model {
     int embd_type;
 };
 
-inline Layer& bind_visit(Model& M, int v) {
+inline Layer& bind_visit(Model& M, int v, int slot = 0) {
     const Visit& Vi = M.V[v];
     Layer& Ly = M.L[Vi.l];
-    Ly.kc = Vi.kc, Ly.vc = Vi.vc, Ly.kc8 = Vi.kc8, Ly.vc8 = Vi.vc8, Ly.kv_cap = Vi.kv_cap;
-    Ly.h_k = Vi.h_k, Ly.h_v = Vi.h_v, Ly.h_attn = Vi.h_attn, Ly.h_mlp = Vi.h_mlp;
+    const size_t C = M.c.C, KD = (size_t) M.c.KV * M.c.D;
+    const size_t kv_off = (Ly.sliding && slot > 0) ? (size_t) slot * Vi.kv_cap * KD : 0;
+    Ly.kc = Vi.kc ? Vi.kc + kv_off : nullptr;
+    Ly.vc = Vi.vc ? Vi.vc + kv_off : nullptr;
+    Ly.kc8 = Vi.kc8 ? Vi.kc8 + kv_off : nullptr;
+    Ly.vc8 = Vi.vc8 ? Vi.vc8 + kv_off : nullptr;
+    Ly.kv_cap = Vi.kv_cap;
+    Ly.page_table = (!Ly.sliding && g_kv_pt_d) ? (g_kv_pt_d + (size_t) slot * g_kv_max_pages) : nullptr;
+    Ly.h_k = Vi.h_k + (size_t) slot * 3 * KD;
+    Ly.h_v = Vi.h_v + (size_t) slot * 3 * KD;
+    Ly.h_attn = Vi.h_attn + (size_t) slot * 3 * C;
+    Ly.h_mlp = Vi.h_mlp + (size_t) slot * 3 * C;
     for (int i = 0; i < 4; ++i) Ly.rec_old[i] = Vi.rec_old[i], Ly.rec_x[i] = Vi.rec_x[i];
     return Ly;
 }
@@ -1589,11 +1609,11 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     if (g_kv_fp8) {
         k::prep_qkv_r_fp8(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
-                          Ly.kv_cap, k_scale, v_scale, g_s);
+                          Ly.kv_cap, k_scale, v_scale, g_s, Ly.page_table);
     } else {
         k::prep_qkv_r_f16(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
-                          Ly.kv_cap, g_s);
+                          Ly.kv_cap, g_s, Ly.page_table);
     }
 
     const int extent = Ly.sliding ? c.extent_swa : c.extent;
@@ -1606,18 +1626,20 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     if (T == 1) {
         if (g_kv_fp8) {
             k::attn_decode_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0,
-                               qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+                               qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s,
+                               Ly.page_table);
         } else {
             k::attn_decode_f16(q_p, r_p, sink_p, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0, qk_scale,
-                               Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+                               Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s, Ly.page_table);
         }
     } else if (T <= 8 && g_group && g_group_attn) {
         if (g_kv_fp8) {
             k::attn_multi_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, T, c.H, c.KV, k0, nk, pos0,
-                              qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+                              qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s,
+                              Ly.page_table);
         } else {
             k::attn_multi_f16(q_p, r_p, sink_p, Ly.kc, Ly.vc, attn_kv_cap, T, c.H, c.KV, k0, nk, pos0, qk_scale,
-                              Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+                              Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s, Ly.page_table);
         }
     } else {
         k::to_f16(q_p, (size_t) T * HD, W.x16, g_s);
@@ -1637,7 +1659,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                   c.d_rel, Ly.rel_proj, extent, window, sink_p + (size_t) ts * c.H, g_s);
             }
         };
-        if (g_flash && c.D == 128 && W.relb && extent <= W.relb_ext) {
+        if ((g_flash || Ly.page_table) && c.D == 128 && W.relb && extent <= W.relb_ext) {
             if (!g_n_sm) CU(cudaDeviceGetAttribute(&g_n_sm, cudaDevAttrMultiProcessorCount, Ly.dev));
             for (int ts = 0; ts < T; ts += Work::kRelbRows) {
                 const int Tq = std::min(Work::kRelbRows, T - ts);
@@ -1650,11 +1672,12 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                 if (g_kv_fp8)
                     k::attn_flash_fp8(W.x16 + (size_t) ts * HD, HD, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, Tq,
                                       pos0 + ts, qk_scale * k_inv, v_inv, W.relb, extent, window,
-                                      sink_p + (size_t) ts * c.H, W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
+                                      sink_p + (size_t) ts * c.H, W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s,
+                                      Ly.page_table);
                 else
                     k::attn_flash_f16(W.x16 + (size_t) ts * HD, HD, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, c.D, Tq,
                                       pos0 + ts, qk_scale, W.relb, extent, window, sink_p + (size_t) ts * c.H,
-                                      W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
+                                      W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s, Ly.page_table);
             }
         } else
         for (int ts = 0; ts < T;) {
@@ -1668,7 +1691,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                 for (int k_off = 0; k_off < nk_s; k_off += W.kv_tmp_cap) {
                     const int nk_c = std::min(W.kv_tmp_cap, nk_s - k_off);
                     k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, attn_kv_cap, k0_s + k_off, nk_c, KD, k_inv, v_inv, W.kv_k16,
-                                            W.kv_v16, g_s);
+                                            W.kv_v16, g_s, Ly.page_table);
                     for (int g = 0; g < c.KV; ++g) {
                         const uint16_t* Kp = W.kv_k16 + (size_t) g * c.D;
                         CB(cublasGemmStridedBatchedEx(
@@ -1683,7 +1706,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                     const int nk_c = std::min(W.kv_tmp_cap, nk_s - k_off);
                     if (nk_s > W.kv_tmp_cap) {
                         k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, attn_kv_cap, k0_s + k_off, nk_c, KD, k_inv, v_inv,
-                                                W.kv_k16, W.kv_v16, g_s);
+                                                W.kv_k16, W.kv_v16, g_s, Ly.page_table);
                     }
                     const float beta = k_off == 0 ? zero : one;
                     for (int g = 0; g < c.KV; ++g) {
@@ -2151,7 +2174,8 @@ struct FastGraph {
 };
 bool tier_active = false;
 bool stage_cold = false;
-FastGraph g_fgraph[2][4]; // by OutMode
+FastGraph g_fgraph[2][4]; // by tier, OutMode (single active slot, evicted on slot switch)
+int g_fgraph_slot = -1;
 
 struct HostExpertPlan {
     ik2::cpu::TransferBuffers buffers;
@@ -2254,7 +2278,7 @@ __global__ void stage_selected_experts(const uint8_t* const* table, const uint8_
         selected[slot] = (const uint8_t*)dst;
 }
 
-void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
+void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
     const Config& c = M.c;
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel;
     const size_t Cb = (size_t) C * 4;
@@ -2269,7 +2293,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
     int nb = 0, nb_pre = 0, n_bank = 0;
     for (int vis = 0; vis < c.n_visit; ++vis) {
         const int l = M.V[vis].l;
-        Layer& Ly = bind_visit(M, vis);
+        Layer& Ly = bind_visit(M, vis, slot);
         // a looped core's passes (as forward()'s)
         const float* msg = nullptr;
         if (c.n_pass > 1 && l == c.core0) {
@@ -2374,25 +2398,26 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         if (g_kv_fp8) {
             k::prep_qkv_r_fp8_at(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap,
-                                 k_scale, v_scale, q16, g_s, Ly.sink16, W.xq, C, W.sink);
+                                 k_scale, v_scale, q16, g_s, Ly.sink16, W.xq, C, W.sink, Ly.page_table);
             if (mma)
                 k::attn_decode_mma_fp8(q16, r_p, W.sink, Ly.kc8, Ly.vc8, ring, c.H, c.KV, W.pos, 0, ns,
                                        qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
-                                       W.o, gate_p, W.x16, g_s);
+                                       W.o, gate_p, W.x16, g_s, Ly.page_table);
             else
                 k::attn_decode_fp8_at(q_p, r_p, W.sink, Ly.kc8, Ly.vc8, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
                                       qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
-                                      W.o, g_s);
+                                      W.o, g_s, Ly.page_table);
         } else {
             k::prep_qkv_r_f16_at(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, q16,
-                                 g_s, Ly.sink16, W.xq, C, W.sink);
+                                 g_s, Ly.sink16, W.xq, C, W.sink, Ly.page_table);
             if (mma)
                 k::attn_decode_mma_f16(q16, r_p, W.sink, Ly.kc, Ly.vc, ring, c.H, c.KV, W.pos, 0, ns, qk_scale,
-                                       Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, W.x16, g_s);
+                                       Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, W.x16, g_s,
+                                       Ly.page_table);
             else
                 k::attn_decode_f16_at(q_p, r_p, W.sink, Ly.kc, Ly.vc, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
-                                      qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+                                      qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s, Ly.page_table);
         }
         if (!mma) k::gate_mul_f16(W.o, gate_p, (size_t) HD, W.x16, true, g_s);   // (the tensor cores' merge has it)
         // the output projection with its short conv (and the stream added, but where a block starts: there the
@@ -2506,20 +2531,31 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
 
 // one token through the resident path: its logits appended to logits_out (kLogits) or its argmax (kArgmax)
 void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>& logits_out,
-                std::vector<int>* argmax_out) {
+                std::vector<int>* argmax_out, int slot = 0) {
     const Config& c = M.c;
     Work& W = dev_work(0);
     const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
     k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W.emb_h);
     W.pos_h[0] = pos;
     if (!g_graph) {
-        fast_token_launches(M, W, out_mode);
+        fast_token_launches(M, W, out_mode, slot);
     } else {
-        FastGraph& G =
-            g_fgraph[(tier_active && (stage_cold || !host_plan.active.empty())) || host_plan.forced][(int)out_mode];
+        if (g_fgraph_slot != slot) {
+            CU(cudaStreamSynchronize(g_s));
+            for (int t = 0; t < 2; ++t)
+                for (int m = 0; m < 4; ++m) {
+                    if (g_fgraph[t][m].exec) CU(cudaGraphExecDestroy(g_fgraph[t][m].exec));
+                    if (g_fgraph[t][m].graph) CU(cudaGraphDestroy(g_fgraph[t][m].graph));
+                    g_fgraph[t][m] = {};
+                }
+            g_fgraph_slot = slot;
+        }
+        FastGraph& G = g_fgraph
+                               [(tier_active && (stage_cold || !host_plan.active.empty())) || host_plan.forced]
+                               [(int) out_mode];
         if (!G.exec) {   // the first token of this kind: its launches recorded
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal));
-            fast_token_launches(M, W, out_mode);
+            fast_token_launches(M, W, out_mode, slot);
             CU(cudaStreamEndCapture(g_s, &G.graph));
             CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
         }
@@ -2552,17 +2588,21 @@ struct BlockBufs {
     bool ready = false;
     float* emb_h = nullptr;      // pinned [kBlockMax][C]: the window's embedding rows
     int* pos_h = nullptr;        // pinned [kBlockMax]: its positions
+    int* slot_ids_h = nullptr;   // pinned [kMaxParallel]: slot ids for fast_slots
+    int* slot_ids_d = nullptr;   // device [kMaxParallel]: slot ids for fast_slots
     float* logits_h = nullptr;   // pinned [kBlockMax][n_vocab] (kLogits)
     const uint8_t** blob = nullptr;   // group_route's arrays, device
     int *n = nullptr, *tok = nullptr, *row = nullptr, *inv = nullptr;
     float *sg = nullptr, *su = nullptr, *wt = nullptr;
     float* lp_msg = nullptr;     // a pass's messages, [n_core][4][kBlockMax][C]
-    k::ConvRec* recs = nullptr;  // every visit's four convs (rollback_block)
+    k::ConvRec* recs[kMaxParallel] = {};   // per-slot visit conv records (rollback_block)
     int n_recs = 0;
     int *cand_d = nullptr, *cand_h = nullptr;   // kCand: each row's k::cand_topk out, [kBlockMax][2 + 2 kCandCap]
 };
 BlockBufs g_blk;
-FastGraph g_bgraph[kBlockMax + 1][4];   // by window size and OutMode
+FastGraph g_bgraph[kBlockMax + 1][4];   // by window size and OutMode (single active slot, evicted on slot switch)
+int g_bgraph_slot = -1;
+FastGraph g_mgraph[kMaxParallel + 1][2][4];           // multi-slot batch: by B, context tier, and OutMode
 
 void block_init(Model& M) {
     if (g_blk.ready) return;
@@ -2570,6 +2610,8 @@ void block_init(Model& M) {
     const int C = c.C, KD = c.KV * c.D, S = kBlockMax * c.K;
     CU(cudaHostAlloc(&g_blk.emb_h, (size_t) kBlockMax * C * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&g_blk.pos_h, (size_t) kBlockMax * 4, cudaHostAllocPortable));
+    CU(cudaHostAlloc(&g_blk.slot_ids_h, (size_t) kMaxParallel * 4, cudaHostAllocPortable));
+    g_blk.slot_ids_d = dalloc<int>(kMaxParallel);
     CU(cudaHostAlloc(&g_blk.logits_h, (size_t) kBlockMax * c.n_vocab * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&g_blk.cand_h, (size_t) kBlockMax * (2 + 2 * kCandCap) * 4, cudaHostAllocPortable));
     g_blk.cand_d = dalloc<int>((size_t) kBlockMax * (2 + 2 * kCandCap));
@@ -2578,18 +2620,23 @@ void block_init(Model& M) {
     g_blk.tok = dalloc<int>((size_t) S * k::kGroupMax), g_blk.row = dalloc<int>((size_t) S * k::kGroupMax);
     g_blk.sg = dalloc<float>(S), g_blk.su = dalloc<float>(S), g_blk.wt = dalloc<float>(S);
     if (c.n_pass > 1) g_blk.lp_msg = dalloc<float>((size_t) (c.core1 - c.core0) * 4 * kBlockMax * C);
-    std::vector<k::ConvRec> recs;
-    for (auto& Vi : M.V) {
-        float* hist[4] = {Vi.h_k, Vi.h_v, Vi.h_attn, Vi.h_mlp};
-        const int cc[4] = {KD, KD, C, C};
-        for (int i = 0; i < 4; ++i) {
-            if (!Vi.rec_old[i] || !Vi.rec_x[i]) die("the block path: the convs' records are not allocated");
-            recs.push_back({Vi.rec_old[i], Vi.rec_x[i], hist[i], cc[i]});
+    if (!M.V.empty() && M.V[0].rec_old[0] && M.V[0].rec_x[0]) {
+        for (int sl = 0; sl < g_parallel; ++sl) {
+            std::vector<k::ConvRec> recs;
+            for (auto& Vi : M.V) {
+                float* hist[4] = {Vi.h_k + (size_t) sl * 3 * KD, Vi.h_v + (size_t) sl * 3 * KD,
+                                  Vi.h_attn + (size_t) sl * 3 * C, Vi.h_mlp + (size_t) sl * 3 * C};
+                const int cc[4] = {KD, KD, C, C};
+                for (int i = 0; i < 4; ++i) {
+                    if (!Vi.rec_old[i] || !Vi.rec_x[i]) die("the block path: the convs' records are not allocated");
+                    recs.push_back({Vi.rec_old[i], Vi.rec_x[i], hist[i], cc[i]});
+                }
+            }
+            g_blk.n_recs = (int) recs.size();
+            g_blk.recs[sl] = dalloc<k::ConvRec>(recs.size());
+            CU(cudaMemcpy(g_blk.recs[sl], recs.data(), recs.size() * sizeof(k::ConvRec), cudaMemcpyHostToDevice));
         }
     }
-    g_blk.n_recs = (int) recs.size();
-    g_blk.recs = dalloc<k::ConvRec>(recs.size());
-    CU(cudaMemcpy(g_blk.recs, recs.data(), recs.size() * sizeof(k::ConvRec), cudaMemcpyHostToDevice));
     g_blk.ready = true;
 }
 
@@ -2599,7 +2646,7 @@ void tile_rows(const Mat& m, int r0, int n, const uint16_t* x16, int T, float* y
     k::q8_tile(m.q8 + (size_t) r0 * m.K, m.q8d + (size_t) r0 * (m.K >> 5), n, m.K, x16, T, y, ldy, g_s);
 }
 
-void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
+void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 0) {
     const Config& c = M.c;
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel, S = T * c.K;
     const size_t TC = (size_t) T * C, TCb = TC * 4;
@@ -2612,7 +2659,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
     int nb = 0, nb_pre = 0, n_bank = 0;
     for (int vis = 0; vis < c.n_visit; ++vis) {
         const int l = M.V[vis].l;
-        Layer& Ly = bind_visit(M, vis);
+        Layer& Ly = bind_visit(M, vis, slot);
         const float* msg = nullptr;
         if (c.n_pass > 1 && l == c.core0) {
             if (M.V[vis].pass == 0) {
@@ -2710,16 +2757,18 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         if (g_kv_fp8) {
             k::prep_qkv_r_fp8_block(q_p, q_ld, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, r_ld, Ly.r_clip, T, c.H,
                                     c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha,
-                                    c.n_floor, Ly.kv_cap, k_scale, v_scale, q16, g_s, Ly.sink16, W.xq, C, W.sink);
+                                    c.n_floor, Ly.kv_cap, k_scale, v_scale, q16, g_s, Ly.sink16, W.xq, C, W.sink,
+                                    Ly.page_table);
             k::attn_block_fp8(q16, r_p, r_ld, W.sink, Ly.kc8, Ly.vc8, ring, c.H, c.KV, W.pos, T, ns, qk_scale / k_scale,
                               1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, gate_ld, W.x16,
-                              g_s);
+                              g_s, Ly.page_table);
         } else {
             k::prep_qkv_r_f16_block(q_p, q_ld, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, r_ld, Ly.r_clip, T, c.H,
                                     c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha,
-                                    c.n_floor, Ly.kv_cap, q16, g_s, Ly.sink16, W.xq, C, W.sink);
+                                    c.n_floor, Ly.kv_cap, q16, g_s, Ly.sink16, W.xq, C, W.sink, Ly.page_table);
             k::attn_block_f16(q16, r_p, r_ld, W.sink, Ly.kc, Ly.vc, ring, c.H, c.KV, W.pos, T, ns, qk_scale,
-                              Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, gate_ld, W.x16, g_s);
+                              Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, gate_ld, W.x16, g_s,
+                              Ly.page_table);
         }
         // the output projection and its short conv (the stream added, but where a block starts)
         const bool first = l % c.block == 0;
@@ -2806,7 +2855,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
 // The window tok [T] at positions pos0 .. pos0 + T - 1 through the block path: argmax_out [T] (kArgmax) or logits_out
 // [T][n_vocab] appended (kLogits).  The convs' records then hold the window (block_rollback takes it back).
 void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std::vector<float>& logits_out,
-                std::vector<int>* argmax_out) {
+                std::vector<int>* argmax_out, int slot = 0) {
     const Config& c = M.c;
     if (T < 1 || T > kBlockMax) die("fast_block: a window of 1 .. 8 tokens");
     if (!g_blk.ready) block_init(M);
@@ -2817,12 +2866,22 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
         g_blk.pos_h[t] = pos0 + t;
     }
     if (!g_graph) {
-        fast_block_launches(M, W, T, out_mode);
+        fast_block_launches(M, W, T, out_mode, slot);
     } else {
+        if (g_bgraph_slot != slot) {
+            CU(cudaStreamSynchronize(g_s));
+            for (int k = 0; k <= kBlockMax; ++k)
+                for (int m = 0; m < 4; ++m) {
+                    if (g_bgraph[k][m].exec) CU(cudaGraphExecDestroy(g_bgraph[k][m].exec));
+                    if (g_bgraph[k][m].graph) CU(cudaGraphDestroy(g_bgraph[k][m].graph));
+                    g_bgraph[k][m] = {};
+                }
+            g_bgraph_slot = slot;
+        }
         FastGraph& G = g_bgraph[T][(int) out_mode];
         if (!G.exec) {
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal));
-            fast_block_launches(M, W, T, out_mode);
+            fast_block_launches(M, W, T, out_mode, slot);
             CU(cudaStreamEndCapture(g_s, &G.graph));
             CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
         }
@@ -2846,8 +2905,255 @@ bool block_cands(const Model& M, int t, std::vector<std::pair<float, int>>& cd) 
     return true;
 }
 // every conv's history as after the first n tokens of the last window (fast_block's records)
-void block_rollback(int n) {
-    k::rollback_block(g_blk.recs, g_blk.n_recs, n, g_s);
+void block_rollback(int n, int slot = 0) {
+    k::rollback_block(g_blk.recs[slot], g_blk.n_recs, n, g_s);
+}
+
+// ---- multi-slot batched decode path: B concurrent requests (2 .. g_parallel), each on its own slot and position,
+// sharing tensor-core dense projections, grouped MoE experts, and a single CUDA graph per (B, tier, OutMode).
+void fast_slots_launches(Model& M, Work& W, int B, int tier, OutMode out_mode) {
+    const Config& c = M.c;
+    const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel, S = B * c.K;
+    const size_t BC = (size_t) B * C, BCb = BC * 4;
+    const float qk_scale = 1.0f / std::sqrt((float) c.D);
+    const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f, v_scale = 32.0f;
+    const int ns_cap = std::max(1, (int) (W.lg_cap / ((size_t) B * 4 * c.H * 130)));
+    const int ns_full = std::min(ns_cap, tier == 0 ? std::max(2, g_mma_split / std::max(1, B / 2))
+                                                   : std::max(g_mma_split, 16));
+    const int ns_sl = std::min(ns_full, std::max(1, (c.window + 255) / 256));
+
+    CU(cudaMemcpyAsync(W.tmp, g_blk.emb_h, BCb, cudaMemcpyHostToDevice, g_s));
+    k::rms(W.tmp, M.embd_norm, B, C, c.eps, W.h, g_s);
+    CU(cudaMemcpyAsync(W.pos, g_blk.pos_h, (size_t) B * 4, cudaMemcpyHostToDevice, g_s));
+    CU(cudaMemcpyAsync(g_blk.slot_ids_d, g_blk.slot_ids_h, (size_t) B * 4, cudaMemcpyHostToDevice, g_s));
+
+    auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
+    int nb = 0, nb_pre = 0, n_bank = 0;
+    for (int vis = 0; vis < c.n_visit; ++vis) {
+        const Visit& Vi = M.V[vis];
+        const int l = Vi.l;
+        Layer& Ly = bind_visit(M, vis, 0);   // base pointers (slot 0) for multi-slot kernels
+        const float* msg = nullptr;
+        if (c.n_pass > 1 && l == c.core0) {
+            if (Vi.pass == 0) {
+                nb_pre = nb;
+                CU(cudaMemcpyAsync(W.lp_pre, W.h, BCb, cudaMemcpyDeviceToDevice, g_s));
+            } else {
+                n_bank = 0;
+                for (int i = nb_pre + 1; i < nb; ++i, ++n_bank)
+                    CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * BC, blk(i), BCb, cudaMemcpyDeviceToDevice, g_s));
+                CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * BC, W.h, BCb, cudaMemcpyDeviceToDevice, g_s));
+                ++n_bank;
+                CU(cudaMemcpyAsync(W.h, W.lp_pre, BCb, cudaMemcpyDeviceToDevice, g_s));
+                nb = nb_pre;
+                k::ResStates st{};
+                for (int i = 0; i < n_bank; ++i) st.st[i] = W.lp_bank + (size_t) i * BC;
+                k::attn_res_jobs_block(st, n_bank, M.lp_query_all, 2, 2 * (c.core1 - c.core0), B, C, 1e-6f,
+                                       g_blk.lp_msg, g_s);
+            }
+        }
+        if (Vi.pass > 0) msg = g_blk.lp_msg + (size_t) (l - c.core0) * 4 * BC;
+        float* x3[3] = {W.xq, W.xk, W.xv};
+        uint16_t* y16[3] = {W.x16, W.xk16, W.xv16};
+        const float* nw[3] = {Ly.sliding ? Ly.attn_norm : Ly.q_in_norm, Ly.sliding ? Ly.attn_norm : Ly.k_in_norm,
+                              Ly.sliding ? Ly.attn_norm : Ly.v_in_norm};
+        bool sep = !Ly.sliding;
+        {
+            k::ResStates st{};
+            for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
+            st.st[nb] = W.h;
+            if (msg) {
+                k::attn_res(st, nb + 1, Ly.res_score, Ly.n_res_q, B, C, 1e-6f, W.lp_in, g_s);
+                k::LoopGate gt[3];
+                for (int j = 0; j < 3; ++j)
+                    gt[j] = {W.lp_in + (size_t) (Ly.n_res_q == 3 ? j : 0) * BC, msg + (size_t) j * BC, Ly.lp_down[j],
+                             Ly.lp_forget[j], Ly.lp_gain[j], x3[j], {Ly.lp_bf[j][0], Ly.lp_bf[j][1], Ly.lp_bf[j][2]}};
+                k::loop_gates(gt, 3, B, C, c.rank, 1e-6f, W.lp_g, g_s);
+                for (int j = 0; j < 3; ++j) k::rms_f16(x3[j], nw[j], B, C, c.eps, y16[j], x3[j], g_s);
+                sep = true;
+            } else if (l > 0) {
+                k::RmsOuts outs{};
+                for (int j = 0; j < Ly.n_res_q; ++j) outs.w[j] = nw[j], outs.y16[j] = y16[j], outs.y32[j] = x3[j];
+                k::attn_res_rms_f16(st, nb + 1, Ly.res_score, Ly.n_res_q, B, C, 1e-6f, c.eps, outs, g_s);
+            } else {
+                for (int j = 0; j < (sep ? 3 : 1); ++j) k::rms_f16(W.h, nw[j], B, C, c.eps, y16[j], x3[j], g_s);
+            }
+        }
+        float *q_p, *r_p, *gate_p;
+        int q_ld, r_ld, gate_ld;
+        if (Ly.sliding) {
+            const Mat& m = Ly.wqkvrg;
+            const int N = m.N;
+            if (!sep) {
+                tile_rows(m, 0, N, W.x16, B, W.qkv, N);
+            } else {
+                tile_rows(m, 0, HD, W.x16, B, W.qkv, N);
+                tile_rows(m, HD, KD, W.xk16, B, W.qkv + HD, N);
+                tile_rows(m, HD + KD, KD, W.xv16, B, W.qkv + HD + KD, N);
+                tile_rows(m, HD + 2 * KD, N - HD - 2 * KD, W.x16, B, W.qkv + HD + 2 * KD, N);
+            }
+            q_p = W.qkv, r_p = W.qkv + HD + 2 * KD, gate_p = r_p + HR;
+            q_ld = r_ld = gate_ld = N;
+            k::conv_slots(W.qkv + HD, N, Vi.h_k, g_blk.slot_ids_d, Ly.sc_k, nullptr, 0, 0, B, KD, nullptr, 0, W.kconv,
+                          KD, g_s);
+            k::conv_slots(W.qkv + HD + KD, N, Vi.h_v, g_blk.slot_ids_d, Ly.sc_v, nullptr, 0, 0, B, KD, nullptr, 0,
+                          W.vconv, KD, g_s);
+        } else {
+            const Mat& m = Ly.wqrg;
+            const int N = m.N;
+            tile_rows(m, 0, N, W.x16, B, W.qkv, N);
+            q_p = W.qkv, r_p = W.qkv + HD, gate_p = r_p + HR;
+            q_ld = r_ld = gate_ld = N;
+            const int DL = c.KV * 4;
+            float *kd = W.dyn, *vd = W.dyn + (size_t) B * DL;
+            k::mv_f16_rows(Ly.sc_k_dyn16, DL, C, W.xk, C, B, kd, DL, g_s);
+            k::mv_f16_rows(Ly.sc_v_dyn16, DL, C, W.xv, C, B, vd, DL, g_s);
+            tile_rows(Ly.wk, 0, KD, W.xk16, B, W.kk, KD);
+            tile_rows(Ly.wv, 0, KD, W.xv16, B, W.vv, KD);
+            k::conv_slots(W.kk, KD, Vi.h_k, g_blk.slot_ids_d, Ly.sc_k, kd, DL, c.KV, B, KD, nullptr, 0, W.kconv, KD,
+                          g_s);
+            k::conv_slots(W.vv, KD, Vi.h_v, g_blk.slot_ids_d, Ly.sc_v, vd, DL, c.KV, B, KD, nullptr, 0, W.vconv, KD,
+                          g_s);
+        }
+        const int extent = Ly.sliding ? c.extent_swa : c.extent;
+        const int window = Ly.sliding ? c.window : (1 << 30);
+        const int ring = Ly.sliding ? Vi.kv_cap : 0;
+        const int* pts = Ly.sliding ? nullptr : g_kv_pt_d;
+        const int ns = Ly.sliding ? ns_sl : ns_full;
+        uint16_t* q16 = W.x16;
+        if (g_kv_fp8) {
+            k::prep_qkv_r_fp8_slots(q_p, q_ld, Ly.q_clip, W.kconv, Vi.kc8, W.vconv, Vi.vc8, r_p, r_ld, Ly.r_clip, B,
+                                    c.H, c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, g_blk.slot_ids_d, pts,
+                                    g_kv_max_pages, !Ly.sliding, c.alpha, c.n_floor, ring, k_scale, v_scale, q16, g_s,
+                                    Ly.sink16, W.xq, C, W.sink);
+            k::attn_slots_fp8(q16, r_p, r_ld, W.sink, Vi.kc8, Vi.vc8, ring, c.H, c.KV, W.pos, g_blk.slot_ids_d, pts,
+                              g_kv_max_pages, B, ns, qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent,
+                              window, W.lg, W.o, gate_p, gate_ld, W.x16, g_s);
+        } else {
+            k::prep_qkv_r_f16_slots(q_p, q_ld, Ly.q_clip, W.kconv, Vi.kc, W.vconv, Vi.vc, r_p, r_ld, Ly.r_clip, B, c.H,
+                                    c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, g_blk.slot_ids_d, pts,
+                                    g_kv_max_pages, !Ly.sliding, c.alpha, c.n_floor, ring, q16, g_s, Ly.sink16, W.xq, C,
+                                    W.sink);
+            k::attn_slots_f16(q16, r_p, r_ld, W.sink, Vi.kc, Vi.vc, ring, c.H, c.KV, W.pos, g_blk.slot_ids_d, pts,
+                              g_kv_max_pages, B, ns, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p,
+                              gate_ld, W.x16, g_s);
+        }
+        const bool first = l % c.block == 0;
+        if (first) CU(cudaMemcpyAsync(blk(nb), W.h, BCb, cudaMemcpyDeviceToDevice, g_s));
+        tile_rows(Ly.wo, 0, C, W.x16, B, W.tmp, C);
+        k::conv_slots(W.tmp, C, Vi.h_attn, g_blk.slot_ids_d, Ly.sc_attn, nullptr, 0, 0, B, C, first ? nullptr : W.h, C,
+                      W.r, C, g_s);
+        if (first) ++nb;
+        {
+            k::ResStates st{};
+            for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
+            st.st[nb] = W.r;
+            if (msg) {
+                k::attn_res(st, nb + 1, Ly.ffn_res_score, 1, B, C, 1e-6f, W.xq, g_s);
+                const k::LoopGate gt{W.xq, msg + (size_t) 3 * BC, Ly.lp_down[3], Ly.lp_forget[3], Ly.lp_gain[3], W.xq,
+                                     {Ly.lp_bf[3][0], Ly.lp_bf[3][1], Ly.lp_bf[3][2]}};
+                k::loop_gates(&gt, 1, B, C, c.rank, 1e-6f, W.lp_g, g_s);
+                k::rms(W.xq, Ly.ffn_norm, B, C, c.eps, W.xq, g_s);
+            } else {
+                k::RmsOuts outs{};
+                outs.w[0] = Ly.ffn_norm, outs.y16[0] = W.x16, outs.y32[0] = W.xq;
+                k::attn_res_rms_f16(st, nb + 1, Ly.ffn_res_score, 1, B, C, 1e-6f, c.eps, outs, g_s);
+            }
+        }
+        k::mv_f16_rows(Ly.router16, c.E, C, W.xq, C, B, W.rlog, c.E, g_s);
+        int* rtop = W.route_d;
+        float* rw = (float*) (W.route_d + S);
+        k::route_rows(W.rlog, Ly.probs_b, B, c.E, c.K, c.route_scale, rtop, rw, g_s);
+        k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], g_blk.blob, g_blk.n,
+                       g_blk.tok, g_blk.row, g_blk.sg, g_blk.su, g_blk.wt, g_blk.inv, g_s);
+        if (k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {
+            uint16_t* limbs = (uint16_t*) W.gu32;
+            k::f16_limbs_rows(W.xq, B, C, limbs, g_s);
+            k::experts_block_gu(g_blk.blob, g_blk.n, g_blk.tok, g_blk.row, S, B, Ly.eb[0], C, c.F, limbs, g_blk.sg,
+                                g_blk.su, c.gate_cap, c.up_cap, W.h16, g_s);
+            k::experts_block_down(g_blk.blob, g_blk.n, g_blk.row, S, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, W.y32, g_s);
+        } else if (Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0 && Ly.ty[2] == k::kQ8_0 && C % 32 == 0 &&
+                   c.F % 32 == 0) {
+            uint16_t* limbs = (uint16_t*) W.gu32;
+            k::f16_limbs_rows(W.xq, B, C, limbs, g_s);
+            k::experts_block_gu_q8(g_blk.blob, g_blk.n, g_blk.tok, g_blk.row, S, B, Ly.eb[0], C, c.F, limbs, g_blk.sg,
+                                   g_blk.su, c.gate_cap, c.up_cap, W.h16, g_s);
+            k::experts_block_down_q8(g_blk.blob, g_blk.n, g_blk.row, S, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, W.y32, g_s);
+        } else {
+            k::experts_gate_up_swiglu_g(g_blk.blob, g_blk.n, g_blk.tok, g_blk.row, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq,
+                                        C, c.F, g_blk.sg, g_blk.su, c.gate_cap, c.up_cap, W.h16, g_s);
+            k::experts_down_g(g_blk.blob, g_blk.n, g_blk.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
+                              g_s);
+        }
+        k::moe_combine_f32(W.y32, g_blk.inv, g_blk.wt, B, c.K, C, W.tmp, false, g_s);
+        k::conv_slots(W.tmp, C, Vi.h_mlp, g_blk.slot_ids_d, Ly.sc_mlp, nullptr, 0, 0, B, C, W.r, C, W.h, C, g_s);
+    }
+    if (out_mode == OutMode::kNone) return;
+    {
+        k::ResStates st{};
+        for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
+        st.st[nb] = W.h;
+        k::RmsOuts outs{};
+        outs.w[0] = M.out_norm, outs.y16[0] = W.x16, outs.y32[0] = W.xq;
+        k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, B, C, 1e-6f, c.eps, outs, g_s);
+        tile_rows(M.out_w, 0, c.n_rows, W.x16, B, W.logits, c.n_rows);
+        if (out_mode == OutMode::kArgmax) {
+            k::argmax_rows(W.logits, c.n_rows, B, c.n_vocab, W.argmax_d, g_s);
+            CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) B * 4, cudaMemcpyDeviceToHost, g_s));
+        } else if (out_mode == OutMode::kCand) {
+            // Also compute exact argmax before softcap so mixed greedy+sampled batches get exact greedy tokens.
+            k::argmax_rows(W.logits, c.n_rows, B, c.n_vocab, W.argmax_d, g_s);
+            CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) B * 4, cudaMemcpyDeviceToHost, g_s));
+            const size_t cs = 2 + 2 * (size_t) kCandCap;
+            k::softcap(W.logits, (size_t) B * c.n_rows, c.logit_cap, g_s);
+            for (int b = 0; b < B; ++b)
+                k::cand_topk(W.logits + (size_t) b * c.n_rows, c.n_vocab, -c.logit_cap, c.logit_cap, kCandK, kCandCap,
+                             W.cand_part, g_blk.cand_d + b * cs, g_s);
+            CU(cudaMemcpyAsync(g_blk.cand_h, g_blk.cand_d, (size_t) B * cs * 4, cudaMemcpyDeviceToHost, g_s));
+        } else {
+            k::softcap(W.logits, (size_t) B * c.n_rows, c.logit_cap, g_s);
+            for (int b = 0; b < B; ++b)
+                CU(cudaMemcpyAsync(g_blk.logits_h + (size_t) b * c.n_vocab, W.logits + (size_t) b * c.n_rows,
+                                   (size_t) c.n_vocab * 4, cudaMemcpyDeviceToHost, g_s));
+        }
+    }
+}
+
+void fast_slots(Model& M, const int* tok, const int* pos, const int* slot_ids, int B, OutMode out_mode,
+                std::vector<float>& logits_out, std::vector<int>* argmax_out) {
+    const Config& c = M.c;
+    if (B < 1 || B > kMaxParallel) die("fast_slots: batch size out of range");
+    if (!g_blk.ready) block_init(M);
+    Work& W = dev_work(0);
+    const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
+    int max_pos = 0;
+    for (int b = 0; b < B; ++b) {
+        k::decode_host(M.embd_type, M.embd + (size_t) tok[b] * rb, c.C, g_blk.emb_h + (size_t) b * c.C);
+        g_blk.pos_h[b] = pos[b];
+        g_blk.slot_ids_h[b] = slot_ids[b];
+        if (pos[b] > max_pos) max_pos = pos[b];
+    }
+    const int tier = max_pos >= 4096 ? 1 : 0;
+    if (!g_graph) {
+        fast_slots_launches(M, W, B, tier, out_mode);
+    } else {
+        FastGraph& G = g_mgraph[B][tier][(int) out_mode];
+        if (!G.exec) {
+            CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal));
+            fast_slots_launches(M, W, B, tier, out_mode);
+            CU(cudaStreamEndCapture(g_s, &G.graph));
+            CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
+        }
+        CU(cudaGraphLaunch(G.exec, g_s));
+    }
+    CU(cudaStreamSynchronize(g_s));
+    if (out_mode == OutMode::kArgmax && argmax_out) {
+        argmax_out->assign(W.argmax_h, W.argmax_h + B);
+    } else if (out_mode == OutMode::kCand && argmax_out) {
+        argmax_out->assign(W.argmax_h, W.argmax_h + B);
+    } else if (out_mode == OutMode::kLogits) {
+        logits_out.insert(logits_out.end(), g_blk.logits_h, g_blk.logits_h + (size_t) B * c.n_vocab);
+    }
 }
 
 
@@ -2951,7 +3257,7 @@ struct SpecCtl {
 // token (the last: not run yet, the next step's anchor), cut after a stop token.  The anchor and next but its last
 // are then in the cache, the convs' histories taken back to them and the drafter's context written for them.
 void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B, const SampleCfg& sc,
-               const std::vector<int>& stops, std::vector<int>& next) {
+               const std::vector<int>& stops, std::vector<int>& next, int slot = 0) {
     const Config& c = M.c;
     static float *raw = nullptr, *anchor_h = nullptr;
     if (!raw) raw = dalloc<float>(c.C), anchor_h = dalloc<float>(c.C);
@@ -2965,7 +3271,7 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
     std::vector<float> lo;
     if (sc.temp <= 0) {
         std::vector<int> g;
-        fast_block(M, tk, B, P, OutMode::kArgmax, lo, &g);
+        fast_block(M, tk, B, P, OutMode::kArgmax, lo, &g, slot);
         int n = 0;
         while (n < B - 1 && dr[n] == g[n]) ++n;
         for (int j = 0; j < n; ++j) next.push_back(dr[j]);
@@ -2973,7 +3279,7 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
     } else {
         // the drafts are the drafter's argmax (a point mass): accept draft d with the target's probability of it,
         // else sample the target's distribution without d - the target's distribution exactly
-        fast_block(M, tk, B, P, OutMode::kCand, lo, nullptr);
+        fast_block(M, tk, B, P, OutMode::kCand, lo, nullptr, slot);
         for (int j = 0; j < B; ++j) {
             std::vector<std::pair<float, int>> cd;
             if (!block_cands(M, j, cd)) {   // (more candidates than kept: the row's logits)
@@ -3005,18 +3311,18 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
             break;
         }
     const int m = (int) next.size();   // (the anchor and next[0 .. m - 2] are kept: m positions)
-    if (m < B) block_rollback(m);
+    if (m < B) block_rollback(m, slot);
     ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, m, P);
     ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, m - 1);
 }
 
 void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode out_mode, const std::string& dump,
-             std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
+             std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp, int slot = 0) {
     k::enable_grouped_tensor_products(allow_short_batch_products());
     const Config& c = M.c;
     const int C = c.C;
     if (g_fast && T == 1 && dump.empty() && !g_prof && !g_rec && !g_trace && g_pop.empty() && g_img.at(pos0) < 0) {
-        fast_token(M, tok[0], pos0, out_mode, logits_out, argmax_out);
+        fast_token(M, tok[0], pos0, out_mode, logits_out, argmax_out, slot);
         return;
     }
     if (out_mode == OutMode::kCand) out_mode = OutMode::kLogits, g_cand.n = -1;   // (this path: the logits)
@@ -3052,7 +3358,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
     int nb_pre = 0, n_bank = 0;   // (a looped core: the blocks before it, the states of the pass before's bank)
     for (int vis = 0; vis < c.n_visit; ++vis) {
         const int l = M.V[vis].l;   // (the layer: its weights, its experts in the cache; the state is the visit's)
-        Layer& Ly = bind_visit(M, vis);
+        Layer& Ly = bind_visit(M, vis, slot);
         if (Ly.dev != g_cur) {   // the next GPU's layers: the stream and the block states go along
             const int from = g_cur;
             Work& F = dev_work(from);
@@ -3733,7 +4039,7 @@ void big_end(Work& W, ExpertCache& EC, BigScratch& bs) {
 
 // Sweeps each layer once across up to W.T_sup tokens (sub-chunked attention for KV/attention scratch, then one combined MoE pass).
 void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chunk, OutMode out_mode,
-                         std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
+                         std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp, int slot = 0) {
     const Config& c = M.c;
     const int C = c.C;
     use_dev(M.L[0].dev);
@@ -3781,7 +4087,7 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
     int nb = 0;
     for (int vis = 0; vis < c.n_visit; ++vis) {   // (no loop here: a looped model's prompts go through forward())
         const int l = M.V[vis].l;
-        Layer& Ly = bind_visit(M, vis);
+        Layer& Ly = bind_visit(M, vis, slot);
         g_pf.start();
         for (int off = 0; off < T; off += sub_chunk) {
             const int ts = std::min(sub_chunk, T - off);
@@ -3854,10 +4160,10 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
 }
 
 // every short conv's history as after the first n of the verify window's tokens
-void rollback(Model& M, int n) {
+void rollback(Model& M, int n, int slot = 0) {
     const int C = M.c.C, KD = M.c.KV * M.c.D;
     for (int vis = 0; vis < (int) M.V.size(); ++vis) {
-        Layer& Ly = bind_visit(M, vis);
+        Layer& Ly = bind_visit(M, vis, slot);
         float* hist[4] = {Ly.h_k, Ly.h_v, Ly.h_attn, Ly.h_mlp};
         const int cc[4] = {KD, KD, C, C};
         for (int i = 0; i < 4; ++i) k::conv_hist_after(Ly.rec_old[i], Ly.rec_x[i], n, cc[i], hist[i], g_s);
@@ -4106,6 +4412,11 @@ int main(int argc, char** argv) {
         else if (a == "--cache-gb") cache_gb = std::atof(next().c_str());
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--gpus") n_gpu = std::atoi(next().c_str());
+        else if (a == "--parallel") {
+            g_parallel = std::atoi(next().c_str());
+            if (g_parallel < 1 || g_parallel > kMaxParallel)
+                die("--parallel must be between 1 and " + std::to_string(kMaxParallel));
+        }
         else if (a == "--draft") draft_path = next();
         else if (a == "--serve") serve = true;
         else if (a == "--serve-ik2") serve = true, serve_maya = false;
@@ -4305,7 +4616,9 @@ int main(int argc, char** argv) {
     g_block = !(getenv("IK2_BLOCK") && !std::atoi(getenv("IK2_BLOCK")));
     g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
+    if (g_parallel > 1 && n_gpu > 1) die("--parallel > 1 requires --gpus 1");
     if (n_gpu == 1 && getenv("IK2_KV_MANAGED") && atoi(getenv("IK2_KV_MANAGED"))) {
+        if (g_parallel > 1) die("--parallel > 1 is not supported with IK2_KV_MANAGED");
         int concurrent = 0;
         CU(cudaDeviceGetAttribute(&concurrent, cudaDevAttrConcurrentManagedAccess, 0));
         if (!concurrent) die("IK2_KV_MANAGED requires concurrent managed memory");
@@ -4320,10 +4633,14 @@ int main(int argc, char** argv) {
             if (t.name.find("_exps.weight") != std::string::npos) exp_b += tensor_bytes(t);
             else if (t.name != "token_embd.weight") dense_b += tensor_bytes(t);
         }
+        const size_t global_cap = g_parallel > 1
+            ? (size_t) ((ctx + k::kKvPageSize - 1) / k::kKvPageSize) * k::kKvPageSize
+            : (size_t) ctx;
         for (int l = 0; l < c.n_layer; ++l) {
-            const size_t cap = c.sliding[l] ? (size_t) std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : (size_t) ctx;
+            const size_t cap = c.sliding[l] ? (size_t) std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : global_cap;
+            const size_t mult = c.sliding[l] ? (size_t) g_parallel : 1;
             if (!g_kv_managed || c.sliding[l])
-                kv_b += (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
+                kv_b += mult * (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
         }
         size_t fr0 = 0, tot0 = 0;
         CU(cudaMemGetInfo(&fr0, &tot0));
@@ -4543,6 +4860,13 @@ int main(int argc, char** argv) {
         }
     }
     // the visits of a token and their state (FP8 E4M3 or FP16 KV; sliding layers ring-buffered in both CLI and --serve)
+    if (g_parallel > 1) {
+        use_dev(0);
+        g_kv_max_pages = (ctx + k::kKvPageSize - 1) / k::kKvPageSize;
+        g_kv_total_pages = g_kv_max_pages;
+        g_kv_pt_d = dalloc<int>((size_t) g_parallel * g_kv_max_pages);
+        CU(cudaMemset(g_kv_pt_d, 0, (size_t) g_parallel * g_kv_max_pages * sizeof(int)));
+    }
     M.V.resize(c.n_visit);
     for (int v = 0; v < c.n_visit; ++v) {
         Visit& Vi = M.V[v];
@@ -4551,18 +4875,20 @@ int main(int argc, char** argv) {
         else Vi.l = v - (c.n_pass - 1) * n_core;
         const Layer& Ly = M.L[Vi.l];
         use_dev(Ly.dev);
-        Vi.kv_cap = Ly.sliding ? std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : ctx;
+        Vi.kv_cap = Ly.sliding ? std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock))
+                               : (g_parallel > 1 ? g_kv_total_pages * k::kKvPageSize : ctx);
+        const size_t kv_rows = Ly.sliding ? (size_t) g_parallel * Vi.kv_cap : (size_t) Vi.kv_cap;
         if (g_kv_fp8) {
-            Vi.kc8 = kv_alloc<uint8_t>((size_t)Vi.kv_cap * KD, Ly.sliding);
-            Vi.vc8 = kv_alloc<uint8_t>((size_t)Vi.kv_cap * KD, Ly.sliding);
+            Vi.kc8 = kv_alloc<uint8_t>(kv_rows * KD, Ly.sliding);
+            Vi.vc8 = kv_alloc<uint8_t>(kv_rows * KD, Ly.sliding);
         } else {
-            Vi.kc = kv_alloc<uint16_t>((size_t)Vi.kv_cap * KD, Ly.sliding);
-            Vi.vc = kv_alloc<uint16_t>((size_t)Vi.kv_cap * KD, Ly.sliding);
+            Vi.kc = kv_alloc<uint16_t>(kv_rows * KD, Ly.sliding);
+            Vi.vc = kv_alloc<uint16_t>(kv_rows * KD, Ly.sliding);
         }
-        Vi.h_k = dalloc<float>(3 * KD);
-        Vi.h_v = dalloc<float>(3 * KD);
-        Vi.h_attn = dalloc<float>(3 * C);
-        Vi.h_mlp = dalloc<float>(3 * C);
+        Vi.h_k = dalloc<float>((size_t) g_parallel * 3 * KD);
+        Vi.h_v = dalloc<float>((size_t) g_parallel * 3 * KD);
+        Vi.h_attn = dalloc<float>((size_t) g_parallel * 3 * C);
+        Vi.h_mlp = dalloc<float>((size_t) g_parallel * 3 * C);
     }
     c.n_rows = (int) (S.info("output.weight")->elements() / C);
     M.out_w = load_mat(S, "output.weight", c.n_rows, (int) C);
@@ -4578,9 +4904,17 @@ int main(int argc, char** argv) {
     if (g_stage) cudaFree(g_stage), g_stage = nullptr, g_stage_bytes = 0;
     {
         size_t kv_bytes = 0;
-        for (const auto& Vi : M.V) kv_bytes += (size_t) Vi.kv_cap * KD * (g_kv_fp8 ? 1 : 2) * 2;
-        std::printf("kv cache: %s (%.2f GiB across %d layer%s)\n", g_kv_fp8 ? "FP8 E4M3" : "FP16",
-                    kv_bytes / 1073741824.0, c.n_visit, c.n_pass > 1 ? " visits" : "s");
+        for (const auto& Vi : M.V) {
+            const size_t mult = M.L[Vi.l].sliding ? (size_t) g_parallel : 1;
+            kv_bytes += mult * (size_t) Vi.kv_cap * KD * (g_kv_fp8 ? 1 : 2) * 2;
+        }
+        if (g_parallel > 1)
+            std::printf("kv cache: %s (%.2f GiB across %d layer%s, parallel=%d, paged global pool=%d pages x %d)\n",
+                        g_kv_fp8 ? "FP8 E4M3" : "FP16", kv_bytes / 1073741824.0, c.n_visit,
+                        c.n_pass > 1 ? " visits" : "s", g_parallel, g_kv_total_pages, k::kKvPageSize);
+        else
+            std::printf("kv cache: %s (%.2f GiB across %d layer%s)\n", g_kv_fp8 ? "FP8 E4M3" : "FP16",
+                        kv_bytes / 1073741824.0, c.n_visit, c.n_pass > 1 ? " visits" : "s");
         std::fflush(stdout);
     }
     size_t fr = 0, tot = 0;
@@ -4955,10 +5289,10 @@ int main(int argc, char** argv) {
     }
     for (auto& Vi : M.V) {   // the conv histories start at zero
         if (M.L[Vi.l].dev != d) continue;
-        CU(cudaMemset(Vi.h_k, 0, 3 * KD * 4));
-        CU(cudaMemset(Vi.h_v, 0, 3 * KD * 4));
-        CU(cudaMemset(Vi.h_attn, 0, 3 * C * 4));
-        CU(cudaMemset(Vi.h_mlp, 0, 3 * C * 4));
+        CU(cudaMemset(Vi.h_k, 0, (size_t) g_parallel * 3 * KD * 4));
+        CU(cudaMemset(Vi.h_v, 0, (size_t) g_parallel * 3 * KD * 4));
+        CU(cudaMemset(Vi.h_attn, 0, (size_t) g_parallel * 3 * C * 4));
+        CU(cudaMemset(Vi.h_mlp, 0, (size_t) g_parallel * 3 * C * 4));
     }
     ExpertCache& EC = g_dev[d].EC;
     CU(cudaMemGetInfo(&fr, &tot));
@@ -5079,6 +5413,753 @@ int main(int argc, char** argv) {
         for (auto& D : g_dev) v += (double) f(D.EC);
         return v;
     };
+
+    if (serve && serve_maya && g_parallel > 1) {
+        // Multi-slot continuous batching server (--serve --parallel N): speaks Maya's multi protocol
+        // ("READY <ctx> stop multi=<N>", GEN/GENI with rid=<id>, PP/T/DONE/ERR with <rid>, STOP <rid>, STOP, QUIT).
+        // Global visits share a paged KV pool (g_kv_total_pages x 256 positions); sliding visits and conv histories
+        // live per slot [0 .. g_parallel - 1].
+        if (eos_ids.empty()) {
+            if (const auto* e = S.get("tokenizer.ggml.eos_token_id")) eos_ids.push_back((int) e->u);
+            eos_ids.push_back(199999);
+        }
+#ifndef _WIN32
+        std::signal(SIGPIPE, SIG_IGN);
+#endif
+        std::signal(SIGUSR1, on_usr1);
+
+        auto parse_ints = [](const std::string& t) {
+            std::vector<int> v;
+            for (const char* p = t.c_str(); *p;) {
+                if (*p == '-' && p[1] == 0) break;
+                v.push_back(std::atoi(p));
+                while (*p && *p != ',') ++p;
+                if (*p == ',') ++p;
+            }
+            return v;
+        };
+
+        struct Snap {
+            int pos = -1;
+            std::vector<std::vector<float>> h;
+            std::vector<std::vector<uint8_t>> kv_k, kv_v;
+        };
+        struct Slot {
+            bool busy = false;
+            uint64_t last_used = 0;
+            std::vector<int> pages;
+            std::vector<int> hist;
+            std::vector<uint64_t> hist_sig;
+            std::vector<float> last_logits;
+            std::vector<Snap> snaps;
+            int snap_next = 0;
+        };
+        const size_t kv_elem_b = g_kv_fp8 ? 1 : 2;
+        const int snaps_per_slot = 4;
+        std::vector<Slot> slots((size_t) g_parallel);
+        for (int s = 0; s < g_parallel; ++s) {
+            slots[s].snaps.resize((size_t) snaps_per_slot);
+            for (auto& sn : slots[s].snaps) {
+                sn.kv_k.resize(M.V.size());
+                sn.kv_v.resize(M.V.size());
+                sn.h.reserve(M.V.size() * 4);
+                for (size_t l = 0; l < M.V.size(); ++l) {
+                    auto& Ly = bind_visit(M, (int) l, s);
+                    const size_t cc[4] = {KD, KD, C, C};
+                    for (int i = 0; i < 4; ++i) sn.h.emplace_back(3 * cc[i], 0.0f);
+                    if (Ly.sliding && Ly.kv_cap < ctx) {
+                        const size_t bytes = (size_t) c.window * KD * kv_elem_b;
+                        sn.kv_k[l].resize(bytes);
+                        sn.kv_v[l].resize(bytes);
+                    }
+                }
+            }
+        }
+        std::vector<int> free_pages;
+        free_pages.reserve((size_t) g_kv_total_pages);
+        for (int p = g_kv_total_pages - 1; p >= 0; --p) free_pages.push_back(p);
+
+        int draft_slot = -1, draft_pos = 0;
+        uint64_t lru_clock = 0;
+        double t_exp = 0;
+
+        auto sync_slot_pt = [&](int s) {
+            if (!g_kv_pt_d || slots[s].pages.empty()) return;
+            use_dev(0);
+            CU(cudaMemcpyAsync(g_kv_pt_d + (size_t) s * g_kv_max_pages, slots[s].pages.data(),
+                               slots[s].pages.size() * sizeof(int), cudaMemcpyHostToDevice, g_s));
+        };
+        auto trim_slot_pages = [&](int s, int keep_tokens) {
+            const int keep_pages = keep_tokens > 0 ? (keep_tokens + k::kKvPageSize - 1) / k::kKvPageSize : 0;
+            bool changed = false;
+            while ((int) slots[s].pages.size() > keep_pages) {
+                free_pages.push_back(slots[s].pages.back());
+                slots[s].pages.pop_back();
+                changed = true;
+            }
+            if (changed) sync_slot_pt(s);
+        };
+        auto snap_copy = [&](int s, Snap& sn, bool save) {
+            const size_t cc[4] = {KD, KD, C, C};
+            const cudaMemcpyKind kv_dir = save ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
+            const size_t row_b = (size_t) KD * kv_elem_b;
+            for (size_t l = 0; l < M.V.size(); ++l) {
+                Layer& Ly = bind_visit(M, (int) l, s);
+                use_dev(Ly.dev);
+                float* hs[4] = {Ly.h_k, Ly.h_v, Ly.h_attn, Ly.h_mlp};
+                for (int i = 0; i < 4; ++i) {
+                    float* sv = sn.h[l * 4 + i].data();
+                    CU(cudaMemcpyAsync(save ? sv : hs[i], save ? hs[i] : sv, 3 * cc[i] * 4, kv_dir, g_s));
+                }
+                if (sn.pos > 0 && Ly.sliding && Ly.kv_cap < ctx) {
+                    const int w = std::min(sn.pos, c.window);
+                    const int k_start = sn.pos - w;
+                    const int s0 = k_start % Ly.kv_cap;
+                    const int n1 = std::min(w, Ly.kv_cap - s0);
+                    const int n2 = w - n1;
+                    uint8_t* dk = g_kv_fp8 ? Ly.kc8 : (uint8_t*) Ly.kc;
+                    uint8_t* dv = g_kv_fp8 ? Ly.vc8 : (uint8_t*) Ly.vc;
+                    uint8_t* hk = sn.kv_k[l].data();
+                    uint8_t* hv = sn.kv_v[l].data();
+                    CU(cudaMemcpyAsync(save ? hk : dk + (size_t) s0 * row_b, save ? dk + (size_t) s0 * row_b : hk,
+                                       (size_t) n1 * row_b, kv_dir, g_s));
+                    CU(cudaMemcpyAsync(save ? hv : dv + (size_t) s0 * row_b, save ? dv + (size_t) s0 * row_b : hv,
+                                       (size_t) n1 * row_b, kv_dir, g_s));
+                    if (n2 > 0) {
+                        CU(cudaMemcpyAsync(save ? hk + (size_t) n1 * row_b : dk,
+                                           save ? dk : hk + (size_t) n1 * row_b, (size_t) n2 * row_b, kv_dir, g_s));
+                        CU(cudaMemcpyAsync(save ? hv + (size_t) n1 * row_b : dv,
+                                           save ? dv : hv + (size_t) n1 * row_b, (size_t) n2 * row_b, kv_dir, g_s));
+                    }
+                }
+            }
+            for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
+        };
+        auto reset_slot = [&](int s) {
+            for (auto& sn : slots[s].snaps) sn.pos = -1;
+            for (int vis = 0; vis < (int) M.V.size(); ++vis) {
+                Layer& Ly = bind_visit(M, vis, s);
+                use_dev(Ly.dev);
+                CU(cudaMemsetAsync(Ly.h_k, 0, 3 * KD * 4, g_s));
+                CU(cudaMemsetAsync(Ly.h_v, 0, 3 * KD * 4, g_s));
+                CU(cudaMemsetAsync(Ly.h_attn, 0, 3 * C * 4, g_s));
+                CU(cudaMemsetAsync(Ly.h_mlp, 0, 3 * C * 4, g_s));
+            }
+            slots[s].hist.clear();
+            slots[s].hist_sig.clear();
+            slots[s].last_logits.clear();
+            trim_slot_pages(s, 0);
+            if (draft_slot == s) draft_slot = -1;
+        };
+        auto evict_idle_slot = [&](int exclude_slot) -> bool {
+            int victim = -1;
+            for (int s = 0; s < g_parallel; ++s) {
+                if (s == exclude_slot || slots[s].busy || slots[s].pages.empty()) continue;
+                if (victim < 0 || slots[s].last_used < slots[victim].last_used) victim = s;
+            }
+            if (victim < 0) return false;
+            reset_slot(victim);
+            return true;
+        };
+        auto ensure_slot_pages = [&](int s, int max_pos_inclusive) -> bool {
+            if (max_pos_inclusive < 0) return true;
+            const int need = (max_pos_inclusive >> k::kKvPageShift) + 1;
+            if (need > g_kv_max_pages) return false;
+            bool added = false;
+            while ((int) slots[s].pages.size() < need) {
+                if (free_pages.empty() && !evict_idle_slot(s)) return false;
+                slots[s].pages.push_back(free_pages.back());
+                free_pages.pop_back();
+                added = true;
+            }
+            if (added) sync_slot_pt(s);
+            return true;
+        };
+
+        std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d parallel=%d\n",
+                    g_kv_fp8 ? "fp8" : "f16", ctx, n_gpu, g_parallel);
+        for (int s = 0; s < g_parallel; ++s) reset_slot(s);
+        CU(cudaStreamSynchronize(g_s));
+        std::printf("READY %d stop multi=%d\n", ctx, g_parallel);
+        std::fflush(stdout);
+        std::fprintf(stderr, "maya-ik2 serve_multi: parallel=%d, paged global KV=%d pages x %d tokens\n",
+                     g_parallel, g_kv_total_pages, k::kKvPageSize);
+
+        static std::mutex m_in;
+        static std::condition_variable cv_in;
+        static std::deque<std::string> q_in;
+        static std::unordered_set<int> stop_rids;
+        static std::atomic<bool> stop_all{false};
+        static bool eof_in = false;
+        std::thread([]() {
+            std::string l;
+            while (std::getline(std::cin, l)) {
+                if (l == "STOP") {
+                    stop_all.store(true);
+                    cv_in.notify_one();
+                    continue;
+                }
+                if (l.rfind("STOP ", 0) == 0) {
+                    const int rid = std::atoi(l.c_str() + 5);
+                    {
+                        std::lock_guard<std::mutex> lk(m_in);
+                        stop_rids.insert(rid);
+                    }
+                    cv_in.notify_one();
+                    continue;
+                }
+                {
+                    std::lock_guard<std::mutex> lk(m_in);
+                    q_in.push_back(std::move(l));
+                }
+                cv_in.notify_one();
+            }
+            {
+                std::lock_guard<std::mutex> lk(m_in);
+                eof_in = true;
+            }
+            cv_in.notify_one();
+        }).detach();
+
+        struct Req {
+            int rid = -1;
+            int slot = -1;
+            int max_new = 0, top_k = 0;
+            double temp = 0, top_p = 1;
+            long long seed = -1;
+            std::string emb_path;
+            std::vector<int> ids;
+            std::vector<uint64_t> sig;
+            Pictures pics;
+            std::mt19937_64 rng;
+            bool prefilling = true;
+            int prefill_pos = 0;
+            int cached = 0;
+            int n_out = 0;
+            int pending_tok = -1;
+            bool emitted = false;
+            bool done = false;
+            double t0 = 0, t1 = 0;
+            const char* reason = "length";
+        };
+        std::deque<std::unique_ptr<Req>> waiting;
+        std::vector<std::unique_ptr<Req>> active;
+        bool quit_req = false;
+
+        auto is_stopped = [&](int rid) -> bool {
+            if (stop_all.load() || g_cancel) return true;
+            std::lock_guard<std::mutex> lk(m_in);
+            return stop_rids.count(rid) > 0;
+        };
+        auto clear_stopped = [&](int rid) {
+            std::lock_guard<std::mutex> lk(m_in);
+            stop_rids.erase(rid);
+        };
+
+        auto pick_top_r = [&](std::vector<std::pair<float, int>>& cd, Req& r) -> int {
+            const int kk = std::min((int) cd.size(), r.top_k > 0 ? std::min(r.top_k, kCandK) : kCandK);
+            std::partial_sort(cd.begin(), cd.begin() + kk, cd.end(),
+                              [](const std::pair<float, int>& a2, const std::pair<float, int>& b2) {
+                                  return a2.first > b2.first || (a2.first == b2.first && a2.second < b2.second);
+                              });
+            std::vector<double> pr(kk);
+            double z = 0;
+            for (int j = 0; j < kk; ++j) z += (pr[j] = std::exp((cd[j].first - cd[0].first) / r.temp));
+            double acc = 0;
+            int keep = kk;
+            for (int j = 0; j < kk; ++j) {
+                acc += pr[j] / z;
+                if (acc >= r.top_p) {
+                    keep = j + 1;
+                    break;
+                }
+            }
+            double zk = 0;
+            for (int j = 0; j < keep; ++j) zk += pr[j];
+            double u = std::uniform_real_distribution<double>(0, zk)(r.rng);
+            for (int j = 0; j < keep; ++j) {
+                u -= pr[j];
+                if (u <= 0) return cd[j].second;
+            }
+            return cd[keep - 1].second;
+        };
+        auto pick_row = [&](const float* row, Req& r) -> int {
+            if (r.temp <= 0) return (int) (std::max_element(row, row + c.n_vocab) - row);
+            std::vector<std::pair<float, int>> cd(c.n_vocab);
+            for (int v = 0; v < c.n_vocab; ++v) cd[v] = {row[v], v};
+            return pick_top_r(cd, r);
+        };
+
+        auto finish_req = [&](Req& r, const char* why) {
+            if (r.done) return;
+            r.reason = why;
+            r.done = true;
+            const double t2 = now();
+            const double p_ms = r.prefilling ? (t2 - r.t0) * 1e3 : (r.t1 - r.t0) * 1e3;
+            const double d_ms = r.prefilling ? 0.0 : (t2 - r.t1) * 1e3;
+            std::printf("DONE %d %d %zu %.1f %.1f %s 0 0 %d\n", r.rid, r.n_out, r.ids.size(), p_ms, d_ms, r.reason,
+                        r.cached);
+            std::fflush(stdout);
+            if (r.slot >= 0) {
+                if (r.prefilling) reset_slot(r.slot);
+                slots[r.slot].busy = false;
+                slots[r.slot].last_used = ++lru_clock;
+            }
+            clear_stopped(r.rid);
+        };
+
+        auto parse_line = [&](const std::string& line) {
+            std::istringstream in(line);
+            std::string cmd, ids_s, emb_path;
+            in >> cmd;
+            if (cmd.empty()) return;
+            if (cmd == "QUIT") {
+                quit_req = true;
+                return;
+            }
+            const bool geni = (cmd == "GENI");
+            if (cmd != "GEN" && !geni) return;
+            auto rq = std::make_unique<Req>();
+            in >> rq->max_new;
+            if (rq->max_new < 0) rq->max_new = 0;
+            std::string w;
+            while (in >> w) {
+                const size_t eq = w.find('=');
+                if (eq == std::string::npos) {
+                    if (geni && emb_path.empty() && ids_s.empty() &&
+                        w.find_first_not_of("0123456789,-") != std::string::npos)
+                        emb_path = w;
+                    else
+                        ids_s = w;
+                    continue;
+                }
+                const std::string k = w.substr(0, eq), v = w.substr(eq + 1);
+                if (k == "temperature") rq->temp = std::atof(v.c_str());
+                else if (k == "top_p") rq->top_p = std::atof(v.c_str());
+                else if (k == "top_k") rq->top_k = std::atoi(v.c_str());
+                else if (k == "seed") rq->seed = std::atoll(v.c_str());
+                else if (k == "rid") rq->rid = std::atoi(v.c_str());
+            }
+            rq->emb_path = emb_path;
+            rq->ids = parse_ints(ids_s);
+            if (rq->ids.empty() || (int) rq->ids.size() + rq->max_new > ctx) {
+                std::printf("ERR %d %s\nDONE %d 0 %zu 0 0 cancel 0 0 0\n", rq->rid,
+                            rq->ids.empty() ? "an empty prompt"
+                                            : ("the prompt and max_tokens pass the context (" + std::to_string(ctx) + ")").c_str(),
+                            rq->rid, rq->ids.size());
+                std::fflush(stdout);
+                return;
+            }
+            rq->sig.assign(rq->ids.size(), 0);
+            if (!rq->emb_path.empty()) {
+                const std::string err = load_pictures(rq->emb_path, rq->ids, image_token, c.C, rq->pics, rq->sig);
+                if (!err.empty()) {
+                    std::printf("ERR %d %s\nDONE %d 0 %zu 0 0 cancel 0 0 0\n", rq->rid, err.c_str(), rq->rid,
+                                rq->ids.size());
+                    std::fflush(stdout);
+                    return;
+                }
+            }
+            rq->rng.seed(rq->seed >= 0 ? (uint64_t) rq->seed
+                                       : (1234ULL ^ ((uint64_t) rq->rid * 0x9e3779b97f4a7c15ULL)));
+            waiting.push_back(std::move(rq));
+        };
+
+        auto drain_stdin = [&](bool block_if_empty) {
+            std::deque<std::string> batch;
+            {
+                std::unique_lock<std::mutex> lk(m_in);
+                if (block_if_empty) {
+                    cv_in.wait(lk, [&] { return !q_in.empty() || eof_in || stop_all.load() || !stop_rids.empty(); });
+                }
+                batch.swap(q_in);
+                if (eof_in && batch.empty()) quit_req = true;
+            }
+            while (!batch.empty()) {
+                parse_line(batch.front());
+                batch.pop_front();
+            }
+        };
+
+        // Compute reusable prefix length and matching snapshot index (-2 = exact match, -1 = reset, >=0 = snap idx)
+        auto match_slot = [&](int s, const Req& r, int& snap_idx) -> int {
+            const Slot& sl = slots[s];
+            size_t L = 0;
+            auto hsig = [&](size_t i) { return i < sl.hist_sig.size() ? sl.hist_sig[i] : (uint64_t) 0; };
+            while (L < sl.hist.size() && L < r.ids.size() && sl.hist[L] == r.ids[L] && hsig(L) == r.sig[L]) ++L;
+            if (L > 0 && L == sl.hist.size() && L < r.ids.size()) {
+                snap_idx = -3;   // pure append on top of current slot state
+                return (int) L;
+            }
+            if (L > 0 && L == sl.hist.size() && L == r.ids.size() && !sl.last_logits.empty()) {
+                snap_idx = -2;   // exact prompt hit with cached logits
+                return (int) L;
+            }
+            int best = -1;
+            for (int i = 0; i < (int) sl.snaps.size(); ++i) {
+                if (sl.snaps[i].pos >= 0 && sl.snaps[i].pos <= (int) L && sl.snaps[i].pos < (int) r.ids.size() &&
+                    (best < 0 || sl.snaps[i].pos > sl.snaps[best].pos))
+                    best = i;
+            }
+            snap_idx = best;
+            return best >= 0 ? sl.snaps[best].pos : 0;
+        };
+
+        auto try_admit = [&]() {
+            while (!waiting.empty()) {
+                if (is_stopped(waiting.front()->rid)) {
+                    auto rq = std::move(waiting.front());
+                    waiting.pop_front();
+                    std::printf("DONE %d 0 %zu 0 0 cancel 0 0 0\n", rq->rid, rq->ids.size());
+                    std::fflush(stdout);
+                    clear_stopped(rq->rid);
+                    continue;
+                }
+                const Req& cand = *waiting.front();
+                int best_s = -1, best_reuse = -1, best_snap = -1;
+                for (int s = 0; s < g_parallel; ++s) {
+                    if (slots[s].busy) continue;
+                    int sn = -1;
+                    const int reuse = match_slot(s, cand, sn);
+                    if (best_s < 0 || reuse > best_reuse ||
+                        (reuse == best_reuse && slots[s].last_used < slots[best_s].last_used)) {
+                        best_s = s, best_reuse = reuse, best_snap = sn;
+                    }
+                }
+                if (best_s < 0) break;   // all slots busy
+
+                // Backpressure check: ensure enough pages exist (free + reclaimable idle) for prompt + 1 decode page.
+                const int prompt_pages = ((int) cand.ids.size() + k::kKvPageSize - 1) / k::kKvPageSize;
+                const int need_pages = active.empty() ? prompt_pages : std::min(g_kv_max_pages, prompt_pages + 1);
+                const int reuse_pages = best_reuse > 0 ? (best_reuse + k::kKvPageSize - 1) / k::kKvPageSize : 0;
+                int avail = (int) free_pages.size() + std::max(0, (int) slots[best_s].pages.size() - reuse_pages);
+                for (int s = 0; s < g_parallel; ++s) {
+                    if (s != best_s && !slots[s].busy) avail += (int) slots[s].pages.size();
+                }
+                if (avail < std::max(0, need_pages - reuse_pages)) {
+                    if (!active.empty()) break;   // wait for an active request to free pages
+                    auto rq = std::move(waiting.front());
+                    waiting.pop_front();
+                    std::printf("ERR %d prompt exceeds paged KV capacity\nDONE %d 0 %zu 0 0 cancel 0 0 0\n",
+                                rq->rid, rq->rid, rq->ids.size());
+                    std::fflush(stdout);
+                    continue;
+                }
+
+                auto rq = std::move(waiting.front());
+                waiting.pop_front();
+                rq->slot = best_s;
+                rq->t0 = now();
+                Slot& sl = slots[best_s];
+                sl.busy = true;
+
+                int L = best_reuse;
+                if (best_snap == -2) {
+                    // Exact prompt cache hit with valid last_logits
+                } else if (best_snap == -3) {
+                    // Pure append on top of sl.hist (L == sl.hist.size() < rq->ids.size())
+                    sl.last_logits.clear();
+                } else if (best_snap >= 0) {
+                    const int sp = sl.snaps[best_snap].pos;
+                    snap_copy(best_s, sl.snaps[best_snap], false);
+                    for (auto& sn : sl.snaps)
+                        if (sn.pos > sp) sn.pos = -1;
+                    sl.hist.resize((size_t) sp);
+                    if (sl.hist_sig.size() > (size_t) sp) sl.hist_sig.resize((size_t) sp);
+                    sl.last_logits.clear();
+                    trim_slot_pages(best_s, sp);
+                    L = sp;
+                } else {
+                    reset_slot(best_s);
+                    L = 0;
+                }
+
+                rq->cached = L;
+                rq->prefill_pos = L;
+                if (drafter) {
+                    if (L == 0 && active.empty()) {
+                        draft_slot = best_s;
+                        draft_pos = 0;
+                    } else if (draft_slot == best_s && L > 0 && draft_pos >= L && (draft_pos - L) <= 1024 &&
+                               L < (int) rq->ids.size()) {
+                        draft_pos = L;
+                    } else if (draft_slot == best_s) {
+                        draft_slot = -1;
+                    }
+                }
+                if (!ensure_slot_pages(best_s, (int) rq->ids.size() - 1)) {
+                    reset_slot(best_s);
+                    sl.busy = false;
+                    std::printf("ERR %d failed to allocate KV pages\nDONE %d 0 %zu 0 0 cancel 0 0 0\n",
+                                rq->rid, rq->rid, rq->ids.size());
+                    std::fflush(stdout);
+                    continue;
+                }
+
+                if (L == (int) rq->ids.size()) {
+                    rq->prefilling = false;
+                    rq->t1 = rq->t0;
+                    if (rq->max_new == 0) {
+                        finish_req(*rq, "length");
+                        continue;
+                    }
+                    rq->pending_tok = pick_row(sl.last_logits.data(), *rq);
+                    rq->emitted = false;
+                } else {
+                    rq->prefilling = true;
+                }
+                active.push_back(std::move(rq));
+            }
+        };
+
+        const bool use_cand = !(getenv("IK2_CAND") && !std::atoi(getenv("IK2_CAND")));
+        SpecCtl sctl;
+        const bool spec_on = drafter && g_fast && g_block;
+        sctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
+        sctl.adapt = !(getenv("IK2_DRAFT_ADAPT") && !atoi(getenv("IK2_DRAFT_ADAPT")));
+        int pf_rr = 0;
+
+        while (true) {
+            drain_stdin(active.empty() && waiting.empty() && !quit_req);
+
+            // Cancel any active requests that received STOP
+            for (auto& rp : active) {
+                if (!rp->done && is_stopped(rp->rid)) finish_req(*rp, "cancel");
+            }
+            active.erase(std::remove_if(active.begin(), active.end(), [](const std::unique_ptr<Req>& p) { return p->done; }),
+                         active.end());
+
+            try_admit();
+
+            if (active.empty()) {
+                if (waiting.empty()) {
+                    stop_all.store(false);
+                    g_cancel = 0;
+                    if (quit_req) {
+                        pop_dump();
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            // 1) Interleaved chunked prefill: run one chunk for one prefilling request per step
+            {
+                Req* pf_req = nullptr;
+                for (size_t off = 0; off < active.size(); ++off) {
+                    Req& r = *active[(pf_rr + off) % active.size()];
+                    if (!r.done && r.prefilling) {
+                        pf_req = &r;
+                        pf_rr = (int) ((pf_rr + off + 1) % active.size());
+                        break;
+                    }
+                }
+                if (pf_req) {
+                    Req& r = *pf_req;
+                    const int p0 = r.prefill_pos;
+                    const int n = std::min(chunk, (int) r.ids.size() - p0);
+                    const bool last_c = (p0 + n == (int) r.ids.size());
+                    std::vector<float> lo;
+                    if (!r.emb_path.empty()) std::swap(g_img, r.pics);
+                    forward(M, r.ids.data() + p0, n, p0, false, last_c ? OutMode::kLogits : OutMode::kNone,
+                            std::string(), lo, nullptr, t_exp, r.slot);
+                    if (!r.emb_path.empty()) std::swap(g_img, r.pics);
+                    if (drafter && draft_slot == r.slot) {
+                        if (draft_pos == p0) {
+                            ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, p0);
+                            if (last_c) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
+                            draft_pos = p0 + n;
+                        } else {
+                            draft_slot = -1;
+                        }
+                    }
+                    r.prefill_pos = p0 + n;
+                    if ((int) r.ids.size() - r.cached > chunk) {
+                        const double ms = (now() - r.t0) * 1e3;
+                        std::printf("PP %d %d %zu %.0f %.1f %d\n", r.rid, r.prefill_pos, r.ids.size(), ms,
+                                    (r.prefill_pos - r.cached) / std::max(1e-3, ms / 1e3), r.cached);
+                        std::fflush(stdout);
+                    }
+                    if (last_c) {
+                        Slot& sl = slots[r.slot];
+                        sl.hist = r.ids;
+                        sl.hist_sig = r.sig;
+                        sl.last_logits = lo;
+                        Snap& sn = sl.snaps[sl.snap_next];
+                        sl.snap_next = (sl.snap_next + 1) % (int) sl.snaps.size();
+                        sn.pos = (int) sl.hist.size();
+                        snap_copy(r.slot, sn, true);
+                        r.t1 = now();
+                        r.prefilling = false;
+                        if (r.max_new == 0) {
+                            finish_req(r, "length");
+                        } else {
+                            r.pending_tok = pick_row(lo.data(), r);
+                            r.emitted = false;
+                        }
+                    }
+                }
+            }
+
+            // 2) Emit any newly produced tokens for decoding requests, and finish stopped/maxed ones
+            std::vector<Req*> dec;
+            bool flushed = false;
+            for (auto& rp : active) {
+                Req& r = *rp;
+                if (r.done || r.prefilling) continue;
+                if (!r.emitted) {
+                    if (is_stopped(r.rid)) {
+                        finish_req(r, "cancel");
+                        continue;
+                    }
+                    std::printf("T %d %d\n", r.rid, r.pending_tok);
+                    flushed = true;
+                    ++r.n_out;
+                    r.emitted = true;
+                    if (std::find(eos_ids.begin(), eos_ids.end(), r.pending_tok) != eos_ids.end()) {
+                        finish_req(r, "stop");
+                        continue;
+                    }
+                    if (r.n_out >= r.max_new || (int) slots[r.slot].hist.size() >= ctx) {
+                        finish_req(r, "length");
+                        continue;
+                    }
+                }
+                dec.push_back(&r);
+            }
+            if (flushed) std::fflush(stdout);
+
+            // 3) Advance decoding requests (solo path with optional DSpark, or CUDA-graphed batched fast_slots)
+            if (!dec.empty()) {
+                // Ensure KV pages for all decoding requests
+                std::vector<Req*> dec_ok;
+                dec_ok.reserve(dec.size());
+                for (Req* rp : dec) {
+                    const int P = (int) slots[rp->slot].hist.size();
+                    if (!ensure_slot_pages(rp->slot, P)) {
+                        finish_req(*rp, "length");
+                        continue;
+                    }
+                    dec_ok.push_back(rp);
+                }
+                if (dec_ok.size() == 1) {
+                    Req& r = *dec_ok[0];
+                    const int sl = r.slot;
+                    const int P = (int) slots[sl].hist.size();
+                    slots[sl].last_logits.clear();
+                    const bool can_spec = spec_on && draft_slot == sl && draft_pos == P;
+                    int B = can_spec ? sctl.choose(std::min(r.max_new - r.n_out, ctx - P)) : 1;
+                    if (B >= 2 && !ensure_slot_pages(sl, P + B - 1)) B = 1;
+                    if (B >= 2) {
+                        SampleCfg sc;
+                        sc.temp = r.temp, sc.top_p = r.top_p, sc.top_k = r.top_k, sc.rng = &r.rng;
+                        std::vector<int> next;
+                        const double ts = now();
+                        spec_step(M, drafter, r.pending_tok, P, B, sc, eos_ids, next, sl);
+                        CU(cudaStreamSynchronize(g_s));
+                        sctl.took_spec(B, (int) next.size() - 1, now() - ts);
+                        slots[sl].hist.push_back(r.pending_tok);
+                        for (size_t j = 0; j + 1 < next.size(); ++j) {
+                            std::printf("T %d %d\n", r.rid, next[j]);
+                            slots[sl].hist.push_back(next[j]);
+                            ++r.n_out;
+                        }
+                        if (next.size() > 1) std::fflush(stdout);
+                        draft_pos = (int) slots[sl].hist.size();
+                        r.pending_tok = next.back();
+                        r.emitted = false;
+                    } else {
+                        const double ts = now();
+                        const OutMode om = r.temp <= 0 ? OutMode::kArgmax : (use_cand ? OutMode::kCand : OutMode::kLogits);
+                        std::vector<float> lo;
+                        std::vector<int> ag;
+                        g_cand.n = -1;
+                        forward(M, &r.pending_tok, 1, P, false, om, std::string(), lo, &ag, t_exp, sl);
+                        slots[sl].hist.push_back(r.pending_tok);
+                        if (drafter && draft_slot == sl && draft_pos == P) {
+                            ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, 1, P);
+                            ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, 0);
+                            draft_pos = P + 1;
+                        } else if (draft_slot == sl) {
+                            draft_slot = -1;
+                        }
+                        if (can_spec) sctl.took_plain(now() - ts);
+                        if (r.temp <= 0) {
+                            r.pending_tok = ag[0];
+                        } else if (g_cand.n >= 0) {
+                            std::vector<std::pair<float, int>> cd(g_cand.n);
+                            for (int i = 0; i < g_cand.n; ++i) cd[i] = {g_cand.val[i], g_cand.idx[i]};
+                            r.pending_tok = pick_top_r(cd, r);
+                        } else {
+                            r.pending_tok = pick_row(lo.data(), r);
+                        }
+                        r.emitted = false;
+                    }
+                } else if (dec_ok.size() >= 2) {
+                    const int B = (int) dec_ok.size();
+                    std::vector<int> toks(B), poss(B), sids(B);
+                    bool any_sample = false;
+                    for (int b = 0; b < B; ++b) {
+                        Req& r = *dec_ok[b];
+                        toks[b] = r.pending_tok;
+                        poss[b] = (int) slots[r.slot].hist.size();
+                        sids[b] = r.slot;
+                        slots[r.slot].last_logits.clear();
+                        if (r.temp > 0) any_sample = true;
+                        if (draft_slot == r.slot) draft_slot = -1;
+                    }
+                    if (g_fast) {
+                        const OutMode om = any_sample ? (use_cand ? OutMode::kCand : OutMode::kLogits) : OutMode::kArgmax;
+                        std::vector<float> lo;
+                        std::vector<int> ag;
+                        fast_slots(M, toks.data(), poss.data(), sids.data(), B, om, lo, &ag);
+                        for (int b = 0; b < B; ++b) {
+                            Req& r = *dec_ok[b];
+                            slots[r.slot].hist.push_back(r.pending_tok);
+                            if (r.temp <= 0) {
+                                r.pending_tok = (om == OutMode::kLogits)
+                                                    ? pick_row(lo.data() + (size_t) b * c.n_vocab, r)
+                                                    : ag[b];
+                            } else if (om == OutMode::kCand) {
+                                std::vector<std::pair<float, int>> cd;
+                                if (block_cands(M, b, cd)) {
+                                    r.pending_tok = pick_top_r(cd, r);
+                                } else {
+                                    std::vector<float> row((size_t) c.n_vocab);
+                                    CU(cudaMemcpy(row.data(), dev_work(0).logits + (size_t) b * c.n_rows,
+                                                  (size_t) c.n_vocab * 4, cudaMemcpyDeviceToHost));
+                                    r.pending_tok = pick_row(row.data(), r);
+                                }
+                            } else {
+                                r.pending_tok = pick_row(lo.data() + (size_t) b * c.n_vocab, r);
+                            }
+                            r.emitted = false;
+                        }
+                    } else {
+                        for (int b = 0; b < B; ++b) {
+                            Req& r = *dec_ok[b];
+                            const OutMode om = r.temp <= 0 ? OutMode::kArgmax : OutMode::kLogits;
+                            std::vector<float> lo;
+                            std::vector<int> ag;
+                            forward(M, &toks[b], 1, poss[b], false, om, std::string(), lo, &ag, t_exp, sids[b]);
+                            slots[r.slot].hist.push_back(r.pending_tok);
+                            r.pending_tok = r.temp <= 0 ? ag[0] : pick_row(lo.data(), r);
+                            r.emitted = false;
+                        }
+                    }
+                }
+            }
+
+            // Sweep finished requests
+            active.erase(std::remove_if(active.begin(), active.end(), [](const std::unique_ptr<Req>& p) { return p->done; }),
+                         active.end());
+            if (active.empty() && waiting.empty()) {
+                stop_all.store(false);
+                g_cancel = 0;
+            }
+        }
+        return 0;
+    }
 
     if (serve) {
         // --serve: requests on stdin, a line each - "GEN max_new temperature top_p seed stop,stop ids,ids,..." - and
