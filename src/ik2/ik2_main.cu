@@ -37,6 +37,7 @@
 #include <atomic>
 #include <cctype>
 #include <fstream>
+#include <functional>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -46,6 +47,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <numeric>
 #include <memory>
 #include <string>
 #include <thread>
@@ -195,8 +197,10 @@ struct Layer {
     // a looped core's layer: its later passes' message gates by module (0 q's, 1 k's, 2 v's, 3 the MoE's) -
     // down [rank][2 C], forget and gain [rank][C] - and the four messages' queries [4][C] in that order (F32)
     float *lp_down[4] = {}, *lp_forget[4] = {}, *lp_gain[4] = {}, *lp_query = nullptr;
+    uint16_t* lp_bf[4][3] = {};
     // the resident token path (every expert in VRAM): where each expert's blocks are, and the experts' scales, on the
     // device ([E] each; a scale's null: 1)
+    uint8_t* tier_cold = nullptr;
     const uint8_t** tab_blob = nullptr;
     float* tab_sc[3] = {};
     std::vector<const uint8_t*> tab_h;             // (tab_blob on the host: a short prompt's groups)
@@ -343,6 +347,16 @@ bool g_dense_q8 = false;
 // top-1 token (KL mean 8.5e-4) and FP8 changed 5 (KL 8.3e-3): Inkling's router is full of near-ties, so FP8's 1.5% in
 // layer 0's attention output already moves 7 of 48 tokens' experts.  The full layers' cache is 32 KB a token in FP16.
 bool g_kv_fp8 = false;
+bool g_kv_managed = false;
+bool g_managed_experts = false;
+size_t g_kv_room = 0;
+
+template <class T> T* kv_alloc(size_t n, bool sliding) {
+    if (sliding || !g_kv_managed) return dalloc<T>(n);
+    T* ptr = nullptr;
+    CU(cudaMallocManaged(&ptr, n * sizeof(T)));
+    return ptr;
+}
 // Q8_0 blocks (2 bytes of FP16 scale, 32 int8 values) taken apart into m.q8 / m.q8d on the device; false if the
 // matrix cannot be kept so (another type, or K not a multiple of 128)
 bool upload_planar(Mat& m, const std::vector<const uint8_t*>& parts, const std::vector<size_t>& part_values) {
@@ -544,6 +558,11 @@ void mv1c(const Mat& m, const float* x, float* y, const k::MvConv& c0, const k::
         if (cv->n) k::conv4_res(y + cv->r0, cv->hist, cv->w, cv->dyn, cv->heads, 1, cv->n, cv->res, cv->y, g_s);
 }
 
+bool g_rec = false;
+bool allow_short_batch_products() {
+    static const bool verify_only = getenv("IK2_VERIFY_ONLY") && atoi(getenv("IK2_VERIFY_ONLY"));
+    return !verify_only || g_rec;
+}
 uint16_t* g_w16 = nullptr;   // a matrix's FP16 decode for the prompt path's GEMMs (the largest of a layer's)
 size_t g_w16_n = 0;          // values it holds
 // Y [T][N] = X [T][K] . W^T: one token straight over the blocks (x32), more through an FP16 decode and a GEMM (x16).
@@ -551,6 +570,20 @@ size_t g_w16_n = 0;          // values it holds
 void matmul(const Mat& m, const float* x32, const uint16_t* x16, int T, float* Y, int ldy) {
     if (m.f16) {
         gemm16(m.f16, m.N, m.K, x16, T, Y, ldy);
+        return;
+    }
+    static const bool use_q8_tile = getenv("IK2_Q8_TILE") && atoi(getenv("IK2_Q8_TILE"));
+    if (use_q8_tile && allow_short_batch_products() && m.q8 && T >= 2 && T <= 16 && m.K % 32 == 0) {
+        k::q8_tile(m.q8, m.q8d, m.N, m.K, x16, T, Y, ldy, g_s);
+        return;
+    }
+    if (m.q8 && T >= 4 && (size_t)m.N * m.K > g_w16_n && g_w16_n >= (size_t)m.K) {
+        const int rows = (int)(g_w16_n / m.K);
+        for (int r = 0; r < m.N; r += rows) {
+            const int n = std::min(rows, m.N - r);
+            k::decode_q8p_f16(m.q8 + (size_t)r * m.K, m.q8d + (size_t)r * (m.K / 32), (size_t)n * m.K, g_w16, g_s);
+            gemm16(g_w16, n, m.K, x16, T, Y + r, ldy);
+        }
         return;
     }
     if (m.K <= 8192 && (T == 1 || (size_t) m.N * m.K > g_w16_n)) {
@@ -593,6 +626,21 @@ uint16_t* dev_f16(const std::vector<float>& v) {
     CU(cudaStreamSynchronize(g_s));
     return p;
 }
+// The GGUF can store expanded BF16 in nominal F32 tensors. Only build the
+// compact decode copy when every discarded bit is zero.
+uint16_t* exact_bf16(const std::vector<float>& values) {
+    std::vector<uint16_t> bits(values.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+        uint32_t word;
+        std::memcpy(&word, &values[i], sizeof(word));
+        if (word & 0xffffu) return nullptr;
+        bits[i] = word >> 16;
+    }
+    uint16_t* device = dalloc<uint16_t>(bits.size());
+    CU(cudaMemcpy(device, bits.data(), bits.size() * sizeof(uint16_t), cudaMemcpyHostToDevice));
+    return device;
+}
+
 float* load_f32(const Shards& S, const std::string& n, size_t expect) { return dev_f32(host_f32(S, n, expect)); }
 uint16_t* load_f16(const Shards& S, const std::string& n, size_t expect) { return dev_f16(host_f32(S, n, expect)); }
 
@@ -1113,7 +1161,6 @@ extern "C" void on_usr1(int) { g_cancel = 1; }
 // inputs are kept, so that a verify window's rejected part can be taken back (rollback()).
 float* g_taps = nullptr;
 int g_taps_ld = 0;
-bool g_rec = false;
 void conv_rec(Layer& Ly, int which, const float* x, const float* hist, int T, int Cc) {
     if (!g_rec) return;
     CU(cudaMemcpyAsync(Ly.rec_old[which], hist, (size_t) 3 * Cc * 4, cudaMemcpyDeviceToDevice, g_s));
@@ -1441,6 +1488,13 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f;
     const float v_scale = 32.0f;
     const float k_inv = 1.0f / k_scale, v_inv = 1.0f / v_scale;
+    // Long prefill revisits a whole global K/V span. Migrate it in bulk before
+    // the flash kernel so warps never have to fault it in one page at a time.
+    if (g_kv_managed && !Ly.sliding && T > 8 && pos0 + T > 196608) {
+        const size_t bytes = (size_t)(pos0 + T) * KD * (g_kv_fp8 ? 1 : 2);
+        CU(cudaMemPrefetchAsync(g_kv_fp8 ? (void*)Ly.kc8 : (void*)Ly.kc, bytes, Ly.dev, g_s));
+        CU(cudaMemPrefetchAsync(g_kv_fp8 ? (void*)Ly.vc8 : (void*)Ly.vc, bytes, Ly.dev, g_s));
+    }
     if (g_kv_fp8) {
         k::prep_qkv_r_fp8(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
@@ -1640,6 +1694,25 @@ void prefetch_layer(Model& M, int l, Work& W, ExpertCache& EC, int T, const Work
     W.pf_layers[pr] = l;
 }
 
+// Each token sums its experts in ascending expert order, exactly as the scalar scatter loop.
+__global__ void combine_prefill_groups(const float* y, const int* rows, const float* weights, int C, int K,
+                                       float* out) {
+    const int t = blockIdx.x;
+    for (int j = threadIdx.x; j < C / 4; j += blockDim.x) {
+        float4 sum = make_float4(0, 0, 0, 0);
+        for (int k = 0; k < K; ++k) {
+            const int row = rows[t * K + k];
+            const float w = weights[row];
+            const float4 v = ((const float4*)(y + (size_t)row * C))[j];
+            sum.x += w * v.x;
+            sum.y += w * v.y;
+            sum.z += w * v.z;
+            sum.w += w * v.w;
+        }
+        ((float4*)(out + (size_t)t * C))[j] = sum;
+    }
+}
+
 void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq16, const int* top, const float* w,
                      const float* r_in, float* h_out, Work& W, ExpertCache& EC, double& t_exp) {
     const Config& c = M.c;
@@ -1719,11 +1792,52 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         XC.t_up += now() - tu;
         g_pf.lap(g_pf.upload);
 
+        static const bool batch_prefill = getenv("IK2_BATCH_PREFILL") && atoi(getenv("IK2_BATCH_PREFILL"));
+        const bool batch = batch_prefill && d == -1 && !Ly.tab_h.empty() && n_miss == 0 && T >= 64 && C % 8 == 0 &&
+                           (size_t)S * (2 * std::max(C, F) + 4 * C) <= X.lg_cap * 4 &&
+                           (size_t)S * 2 * F * sizeof(float) <= X.gu32_bytes;
+        if (batch) {
+            for (int t = 0; t < T; ++t)
+                std::sort(inv + t * c.K, inv + (t + 1) * c.K);
+        }
         CU(cudaMemcpyAsync(X.gidx, gidx, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
         CU(cudaMemcpyAsync(X.inv, inv, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
         CU(cudaMemcpyAsync(X.sg, sg, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
         CU(cudaMemcpyAsync(X.su, su, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
         CU(cudaMemcpyAsync(X.wtr, wtr, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
+        auto gate_up_product = [&](int e, const uint16_t* input, float* output) {
+            const uint8_t* blob = X.slot_ptrs[e];
+            if (Ly.ty[0] == Ly.ty[1]) {
+                k::decode_f16(Ly.ty[0], blob, (size_t)2 * F * C, X.w16, g_s);
+            } else {
+                k::decode_f16(Ly.ty[0], blob, (size_t)F * C, X.w16, g_s);
+                k::decode_f16(Ly.ty[1], blob + Ly.eb[0], (size_t)F * C, X.w16 + (size_t)F * C, g_s);
+            }
+            gemm16(X.w16, 2 * F, C, input, W.cnt[e], output, 2 * F);
+        };
+        auto down_product = [&](int e, const uint16_t* hidden, float* output) {
+            const uint8_t* down = X.slot_ptrs[e] + Ly.eb[0] + Ly.eb[1];
+            k::decode_f16(Ly.ty[2], down, (size_t)C * F, X.w16, g_s);
+            gemm16(X.w16, C, F, hidden, W.cnt[e], output, C);
+        };
+        if (batch) {
+            // Attention has finished. Its temporary output is free until the next visit.
+            uint16_t* sorted_input = (uint16_t*)X.lg;
+            float* sorted_out = (float*)(sorted_input + (size_t)S * std::max(C, F));
+            gather_f16_16_kernel<<<S, 256, 0, g_s>>>(xin, X.gidx, S, C, sorted_input);
+            for (int e : X.hit_exps) {
+                const size_t offset = W.start[e];
+                gate_up_product(e, sorted_input + offset * C, X.gu32 + offset * 2 * F);
+            }
+            k::swiglu_cap_f32(X.gu32, S, F, X.sg, X.su, c.gate_cap, c.up_cap, sorted_input, g_s);
+            for (int e : X.hit_exps) {
+                const size_t offset = W.start[e];
+                down_product(e, sorted_input + offset * F, sorted_out + offset * C);
+            }
+            combine_prefill_groups<<<T, 256, 0, g_s>>>(sorted_out, X.inv, X.wtr, C, c.K, X.tmp);
+            X.pf_layers[l % Work::kPfRing] = -1;
+            return;
+        }
         CU(cudaMemsetAsync(X.tmp, 0, (size_t) T * C * 4, g_s));
 
         // Each expert: its tokens gathered, gate/up, SwiGLU, down, then added into tmp with their weights. The experts run
@@ -1731,18 +1845,10 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         // depend on the cache. Only [T][C] of scratch: no [T * K][C] copies of the inputs or the outputs.
         auto run_exp = [&](int e) {
             const int cnt_e = W.cnt[e], st_e = W.start[e];
-            const uint8_t* sl = X.slot_ptrs[e];
             gather_f16_16_kernel<<<cnt_e, 256, 0, g_s>>>(xin, X.gidx + st_e, cnt_e, C, X.ex16);
-            if (Ly.ty[0] == Ly.ty[1]) {
-                k::decode_f16(Ly.ty[0], sl, (size_t) 2 * F * C, X.w16, g_s);
-            } else {
-                k::decode_f16(Ly.ty[0], sl, (size_t) F * C, X.w16, g_s);
-                k::decode_f16(Ly.ty[1], sl + Ly.eb[0], (size_t) F * C, X.w16 + (size_t) F * C, g_s);
-            }
-            gemm16(X.w16, 2 * F, C, X.ex16, cnt_e, X.gu32, 2 * F);
+            gate_up_product(e, X.ex16, X.gu32);
             k::swiglu_cap_f32(X.gu32, cnt_e, F, X.sg + st_e, X.su + st_e, c.gate_cap, c.up_cap, X.h16, g_s);
-            k::decode_f16(Ly.ty[2], sl + Ly.eb[0] + Ly.eb[1], (size_t) C * F, X.w16, g_s);
-            gemm16(X.w16, C, F, X.h16, cnt_e, X.y32, C);
+            down_product(e, X.h16, X.y32);
             scatter_add_rows_kernel<<<cnt_e, 256, 0, g_s>>>(X.y32, X.gidx + st_e, X.wtr + st_e, C, X.tmp, C);
         };
         const bool pf = X.pf_layers[l % Work::kPfRing] == l;
@@ -1951,9 +2057,25 @@ struct FastGraph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
 };
-FastGraph g_fgraph[4];      // by OutMode
+bool tier_active = false;
+bool stage_cold = false;
+FastGraph g_fgraph[2][4]; // by OutMode
 
 // one token's launches: its embedding row in W.emb_h and its position in W.pos_h[0] (pinned host; copied first)
+// Stage only remote expert blobs with long, coalesced PCIe reads.
+__global__ void stage_selected_experts(const uint8_t* const* table, const uint8_t* remote, const int* indices,
+                                       const uint8_t** selected, size_t nvec, uint4* scratch) {
+    const int slot = blockIdx.y, e = indices[slot];
+    if (!remote[e])
+        return;
+    const uint4* src = (const uint4*)table[e];
+    uint4* dst = scratch + (size_t)slot * nvec;
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < nvec; i += blockDim.x * gridDim.x)
+        dst[i] = src[i];
+    if (!blockIdx.x && !threadIdx.x)
+        selected[slot] = (const uint8_t*)dst;
+}
+
 void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
     const Config& c = M.c;
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel;
@@ -2005,8 +2127,13 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                 k::attn_res(st, nb + 1, Ly.res_score, Ly.n_res_q, 1, C, 1e-6f, W.lp_in, g_s);
                 k::LoopGate gt[3];
                 for (int j = 0; j < 3; ++j)
-                    gt[j] = {W.lp_in + (size_t) (Ly.n_res_q == 3 ? j : 0) * C, msg + (size_t) j * C, Ly.lp_down[j],
-                             Ly.lp_forget[j], Ly.lp_gain[j], x3[j]};
+                    gt[j] = {W.lp_in + (size_t)(Ly.n_res_q == 3 ? j : 0) * C,
+                             msg + (size_t)j * C,
+                             Ly.lp_down[j],
+                             Ly.lp_forget[j],
+                             Ly.lp_gain[j],
+                             x3[j],
+                             {Ly.lp_bf[j][0], Ly.lp_bf[j][1], Ly.lp_bf[j][2]}};
                 k::loop_gates(gt, 3, 1, C, c.rank, 1e-6f, W.lp_g, g_s);
                 k::rms_multi(k::RmsJobs{{x3[0], x3[1], x3[2]}, {nw[0], nw[1], nw[2]}, {x3[0], x3[1], x3[2]}}, 3, C, c.eps,
                              g_s);
@@ -2098,8 +2225,14 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             st.st[nb] = W.r;
             if (msg) {
                 k::attn_res(st, nb + 1, Ly.ffn_res_score, 1, 1, C, 1e-6f, W.xq, g_s);
-                k::loop_gate(W.xq, msg + (size_t) 3 * C, Ly.lp_down[3], Ly.lp_forget[3], Ly.lp_gain[3], 1, C, c.rank,
-                             1e-6f, W.lp_g, W.xq, g_s);
+                const k::LoopGate gt{W.xq,
+                                     msg + (size_t)3 * C,
+                                     Ly.lp_down[3],
+                                     Ly.lp_forget[3],
+                                     Ly.lp_gain[3],
+                                     W.xq,
+                                     {Ly.lp_bf[3][0], Ly.lp_bf[3][1], Ly.lp_bf[3][2]}};
+                k::loop_gates(&gt, 1, 1, C, c.rank, 1e-6f, W.lp_g, g_s);
                 k::rms(W.xq, Ly.ffn_norm, 1, C, c.eps, W.xq, g_s);
             } else {
                 k::RmsOuts outs{};
@@ -2110,11 +2243,31 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         k::mv_f16(Ly.router16, c.E, C, W.xq, W.rlog, g_s);
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + c.K);
+        static const int limb = getenv("IK2_EXPERT_LIMB") ? atoi(getenv("IK2_EXPERT_LIMB")) : 0;
+        const bool q8_gate = Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0;
+        const bool fast_gate =
+            C % 64 == 0 && (((limb & 1) && Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4) || ((limb & 4) && q8_gate));
+        const bool fast_down =
+            c.F % 64 == 0 && (((limb & 2) && Ly.ty[2] == k::kNVFP4) || ((limb & 8) && Ly.ty[2] == k::kQ8_0));
         k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
-                       Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s);
-        k::experts_gate_up_swiglu(W.blob, W.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, W.sg, W.su,
-                                  c.gate_cap, c.up_cap, W.h16, g_s);
-        k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+                       Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
+                       fast_gate ? W.gu32 : nullptr, q8_gate);
+
+        const size_t exbytes = Ly.eb[0] + Ly.eb[1] + Ly.eb[2];
+        if (stage_cold && tier_active && exbytes % 16 == 0 && exbytes * c.K <= W.lg_cap * sizeof(float))
+            stage_selected_experts<<<dim3(128, c.K), 256, 0, g_s>>>(Ly.tab_blob, Ly.tier_cold, rtop, W.blob,
+                                                                    exbytes / 16, (uint4*)W.lg);
+        if (fast_gate)
+            k::expert_limb_mv(true, W.blob, Ly.eb[0], C, c.F, c.K, W.xq, W.h16, W.y32, W.sg, W.su, c.gate_cap, c.up_cap,
+                              W.gu32, g_s, q8_gate, true);
+        else
+            k::experts_gate_up_swiglu(W.blob, W.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, W.sg, W.su,
+                                      c.gate_cap, c.up_cap, W.h16, g_s);
+        if (fast_down && C % 2 == 0)
+            k::expert_limb_mv(false, W.blob, Ly.eb[0] + Ly.eb[1], C, c.F, c.K, W.xq, W.h16, W.y32, W.sg, W.su,
+                              c.gate_cap, c.up_cap, W.gu32, g_s, Ly.ty[2] == k::kQ8_0, false);
+        else
+            k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
         k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
     }
     if (out_mode == OutMode::kNone) return;
@@ -2151,7 +2304,7 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     if (!g_graph) {
         fast_token_launches(M, W, out_mode);
     } else {
-        FastGraph& G = g_fgraph[(int) out_mode];
+        FastGraph& G = g_fgraph[tier_active && stage_cold][(int)out_mode];
         if (!G.exec) {   // the first token of this kind: its launches recorded
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal));
             fast_token_launches(M, W, out_mode);
@@ -2178,6 +2331,7 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
 
 void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode out_mode, const std::string& dump,
              std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
+    k::enable_grouped_tensor_products(allow_short_batch_products());
     const Config& c = M.c;
     const int C = c.C;
     if (g_fast && T == 1 && dump.empty() && !g_prof && !g_rec && !g_taps && !g_trace && g_pop.empty() &&
@@ -2542,10 +2696,10 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
             // (the stream was synchronised after the routing: the copy of the last layer's tables is done)
             CU(cudaMemcpyAsync(W.rg_d, W.rg_h, W.rg_bytes, cudaMemcpyHostToDevice, g_s));
-            k::experts_gate_up_swiglu_g((const uint8_t* const*) W.rg_d, (const int*) (W.rg_d + o_n),
-                                        (const int*) (W.rg_d + o_tok), (const int*) (W.rg_d + o_row), G, Ly.ty[0],
-                                        Ly.ty[1], Ly.eb[0], W.xq, C, c.F, (const float*) (W.rg_d + o_sg),
-                                        (const float*) (W.rg_d + o_su), c.gate_cap, c.up_cap, W.h16, g_s);
+            k::experts_gate_up_swiglu_g((const uint8_t* const*)W.rg_d, (const int*)(W.rg_d + o_n),
+                                        (const int*)(W.rg_d + o_tok), (const int*)(W.rg_d + o_row), G, Ly.ty[0],
+                                        Ly.ty[1], Ly.eb[0], W.xq, C, c.F, (const float*)(W.rg_d + o_sg),
+                                        (const float*)(W.rg_d + o_su), c.gate_cap, c.up_cap, W.h16, g_s, W.x16);
             k::experts_down_g((const uint8_t* const*) W.rg_d, (const int*) (W.rg_d + o_n), (const int*) (W.rg_d + o_row),
                               G, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
             k::moe_combine_f32(W.y32, (const int*) (W.rg_d + o_id), (const float*) (W.rg_d + o_wt), T, c.K, C, W.tmp,
@@ -3026,6 +3180,202 @@ void rollback(Model& M, int n) {
     }
 }
 
+// Cold prefill sweeps all experts. Keep its physical GPU allocation until an
+// actual deep decode needs the room, then change the backing of the pools. The
+// GPU pointer tables themselves are stable, including inside captured graphs.
+constexpr int kPlacementInterval = 8192;
+int tier_depth = 0;
+std::map<uint8_t*, bool> tier_host_groups;
+
+void replace_expert_pools(Model& M, bool managed) {
+    ExpertCache& ec = dev_cache(0);
+    CU(cudaStreamSynchronize(g_s));
+    CU(cudaStreamSynchronize(g_cs));
+    if (!managed) {
+        // Give back the global pages first so regular cudaMalloc has room.
+        const size_t row_bytes = (size_t)M.c.KV * M.c.D * (g_kv_fp8 ? 1 : 2);
+        for (auto& v : M.V) {
+            if (M.L[v.l].sliding) continue;
+            const size_t bytes = (size_t)std::min(tier_depth, v.kv_cap) * row_bytes;
+            if (!bytes) continue;
+            CU(cudaMemPrefetchAsync(g_kv_fp8 ? (void*)v.kc8 : (void*)v.kc, bytes, cudaCpuDeviceId, g_s));
+            CU(cudaMemPrefetchAsync(g_kv_fp8 ? (void*)v.vc8 : (void*)v.vc, bytes, cudaCpuDeviceId, g_s));
+        }
+        CU(cudaStreamSynchronize(g_s));
+    }
+    for (auto& pool : ec.pools) {
+        const size_t bytes = (size_t)pool.n_slots * pool.slot_bytes;
+        CU(cudaFree(pool.data));
+        if (managed)
+            CU(cudaMallocManaged(&pool.data, bytes));
+        else
+            pool.data = dalloc<uint8_t>(bytes);
+        for (int i = 0; i < pool.n_slots; ++i) {
+            const int owner = pool.owner[i];
+            if (owner < 0) continue;
+            const int l = owner / M.c.E, e = owner % M.c.E;
+            const Layer& ly = M.L[l];
+            auto* dst = pool.data + (size_t)i * pool.slot_bytes;
+            if (managed) {
+                // First touch on the CPU. Copy only the serialized tensor bytes.
+                for (int part = 0; part < 3; ++part) {
+                    std::memcpy(dst, ly.host[part] + (size_t)e * ly.stride[part], ly.eb[part]);
+                    dst += ly.eb[part];
+                }
+            } else
+                ec.copy_in(ly, e, dst, g_cs);
+        }
+        if (managed) CU(cudaMemAdvise(pool.data, bytes, cudaMemAdviseSetAccessedBy, 0));
+    }
+    CU(cudaStreamSynchronize(g_cs));
+    for (int l = 0; l < M.c.n_layer; ++l) {
+        Layer& ly = M.L[l];
+        const auto& pool = ec.pools[ec.layer_pool[l]];
+        for (int e = 0; e < M.c.E; ++e) {
+            const int slot = ec.loc[(size_t)l * M.c.E + e];
+            ly.tab_h[e] = pool.data + (size_t)slot * pool.slot_bytes;
+        }
+        CU(cudaMemcpy(ly.tab_blob, ly.tab_h.data(), ly.tab_h.size() * sizeof(void*), cudaMemcpyHostToDevice));
+    }
+    tier_host_groups.clear();
+    tier_active = managed;
+}
+
+// For deep decode, eight full K/V visits can be many times larger than the
+// routed weights read in one step. Keep the live K/V on the GPU and move the
+// least used expert ranges to host memory. The graph keeps the same pointers.
+void place_decode(Model& M, int depth) {
+    if (!g_managed_experts || !g_fast) return;
+    Work& W = dev_work(0);
+    ExpertCache& ec = dev_cache(0);
+    const int elements = M.c.KV * M.c.D;
+    const int token_bytes = elements * (g_kv_fp8 ? 1 : 2);
+    size_t live = 0;
+    for (const auto& v : M.V) {
+        if (!M.L[v.l].sliding) live += (size_t)2 * std::min(v.kv_cap, depth + kPlacementInterval) * token_bytes;
+    }
+    const size_t need = live > g_kv_room ? live - g_kv_room : 0;
+    struct Group {
+        uint8_t* ptr;
+        size_t bytes;
+        double score;
+    };
+    if (!need) {
+        if (tier_active) replace_expert_pools(M, false);
+        return;
+    }
+    const bool just_converted = !tier_active;
+    if (just_converted) replace_expert_pools(M, true);
+    tier_depth = depth;
+    std::vector<Group> groups;
+    for (auto& pool : ec.pools) {
+        // These slot sizes end on half an OS page. Two slots have disjoint
+        // page ranges, and preserve more of the routing profile than large groups.
+        const int span = pool.slot_bytes % 4096 == 0 ? 1 : 4096 / std::gcd(pool.slot_bytes, size_t(4096));
+        for (int i = 0; i < pool.n_slots; i += span) {
+            const int n = std::min(span, pool.n_slots - i);
+            uint64_t score = 0;
+            for (int j = 0; j < n; ++j) {
+                const int idx = pool.owner[i + j];
+                if (idx < 0) continue;
+                const int l = idx / M.c.E;
+                score += W.use.empty() ? ((l >= M.c.core0 && l < M.c.core1) ? M.c.n_pass : 1) : W.use[idx];
+            }
+            groups.push_back({pool.data + i * pool.slot_bytes, n * pool.slot_bytes, (double)score / n});
+        }
+    }
+    std::stable_sort(groups.begin(), groups.end(), [](const Group& a, const Group& b) { return a.score < b.score; });
+    size_t cold = 0;
+    for (auto& group : groups) {
+        const bool host = cold < need;
+        if (host) cold += group.bytes;
+        if (!just_converted && (tier_host_groups.count(group.ptr) != 0) == host) continue;
+        const int loc = host ? cudaCpuDeviceId : 0;
+        CU(cudaMemAdvise(group.ptr, group.bytes, cudaMemAdviseSetPreferredLocation, loc));
+        CU(cudaMemPrefetchAsync(group.ptr, group.bytes, loc, g_s));
+        if (host)
+            tier_host_groups[group.ptr] = true;
+        else
+            tier_host_groups.erase(group.ptr);
+    }
+    if (stage_cold) {
+        std::vector<uint8_t> flags(M.c.E);
+        for (int l = 0; l < M.c.n_layer; ++l) {
+            auto& ly = M.L[l];
+            auto& pool = ec.pools[ec.layer_pool[l]];
+            const size_t span = 4096 / std::gcd(pool.slot_bytes, size_t(4096));
+            for (int e = 0; e < M.c.E; ++e) {
+                const size_t slot = ec.loc[(size_t)l * M.c.E + e];
+                flags[e] = tier_host_groups.count(pool.data + (slot / span) * span * pool.slot_bytes) != 0;
+            }
+            CU(cudaMemcpy(ly.tier_cold, flags.data(), flags.size(), cudaMemcpyHostToDevice));
+        }
+    }
+    if (cold) {
+        for (auto& v : M.V) {
+            if (M.L[v.l].sliding) continue;
+            const size_t bytes = (size_t)std::min(depth, v.kv_cap) * token_bytes;
+            if (!bytes) continue;
+            CU(cudaMemPrefetchAsync(g_kv_fp8 ? (void*)v.kc8 : (void*)v.kc, bytes, 0, g_s));
+            CU(cudaMemPrefetchAsync(g_kv_fp8 ? (void*)v.vc8 : (void*)v.vc, bytes, 0, g_s));
+        }
+    }
+    CU(cudaStreamSynchronize(g_s));
+    std::fprintf(stderr, "decode placement: depth %d, %.2f GiB of expert weights on host\n", depth,
+                 cold / 1073741824.0);
+}
+
+// A repeated suffix proposes tokens already present earlier in this request. Every proposed
+// token is checked against the full target; the first mismatch supplies the next anchor.
+int suffix_window = 0;
+struct SuffixStats {
+    int forwards = 0;
+    int inputs = 0;
+    int offered = 0;
+    int accepted = 0;
+};
+using RowSampler = std::function<int(const float*)>;
+int verify_suffix(Model& M, const std::vector<int>& hist, int anchor, int remaining, const std::vector<int>& stops,
+                  std::vector<int>& next, double& t_exp, SuffixStats& stats, const RowSampler& sample = {}) {
+    constexpr int match = 12;
+    const int end = (int)hist.size();
+    if (!g_fast || !suffix_window || remaining < match || end < 2 * match) return 0;
+    int src = end - match;
+    const int floor = std::max(match - 1, end - 65536);
+    for (; src >= floor; --src) {
+        if (hist[src] == anchor &&
+            std::equal(hist.begin() + src - match + 1, hist.begin() + src, hist.end() - match + 1))
+            break;
+    }
+    if (src < floor) return 0;
+    int matched = match;
+    while (matched < suffix_window && src >= matched && hist[src - matched] == hist[end - matched])
+        ++matched;
+    const int n = std::min({suffix_window, remaining, end - src, 2 * matched - 8});
+    if (n < match) return 0;
+    std::vector<float> logits;
+    std::vector<int> predicted;
+    ++stats.forwards;
+    stats.offered += n - 1;
+    g_rec = true;
+    forward(M, hist.data() + src, n, end, true, sample ? OutMode::kLogits : OutMode::kArgmax, std::string(), logits,
+            &predicted, t_exp);
+    g_rec = false;
+    // Sample from the target once per committed next token. No random numbers
+    // are consumed for positions beyond a rejected proposal.
+    for (int i = 0; i < n; ++i) {
+        const int picked = sample ? sample(logits.data() + (size_t)i * M.c.n_vocab) : predicted[i];
+        next.push_back(picked);
+        if (i + 1 == n || picked != hist[src + i + 1]) break;
+        ++stats.accepted;
+        if (std::find(stops.begin(), stops.end(), picked) != stops.end()) break;
+    }
+    const int used = (int)next.size();
+    stats.inputs += used;
+    if (used < n) rollback(M, used);
+    return used;
+}
+
 // the embedding row of token t, normed as the model's input, into out (device [C])
 void embed_row(Model& M, int t, float* raw, float* out) {
     const int C = M.c.C;
@@ -3264,6 +3614,13 @@ int main(int argc, char** argv) {
     g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
     g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
+    if (n_gpu == 1 && getenv("IK2_KV_MANAGED") && atoi(getenv("IK2_KV_MANAGED"))) {
+        int concurrent = 0;
+        CU(cudaDeviceGetAttribute(&concurrent, cudaDevAttrConcurrentManagedAccess, 0));
+        if (!concurrent) die("IK2_KV_MANAGED requires concurrent managed memory");
+        g_kv_managed = true;
+        std::printf("global KV: on-demand managed pages, sliding KV in VRAM\n");
+    }
     if (n_gpu == 1 && !g_pool) {
         size_t exp_b = 0, dense_b = 0, kv_b = 0;
         for (const auto& kv : S.by_name) {
@@ -3274,7 +3631,8 @@ int main(int argc, char** argv) {
         }
         for (int l = 0; l < c.n_layer; ++l) {
             const size_t cap = c.sliding[l] ? (size_t) std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : (size_t) ctx;
-            kv_b += (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
+            if (!g_kv_managed || c.sliding[l])
+                kv_b += (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
         }
         size_t fr0 = 0, tot0 = 0;
         CU(cudaMemGetInfo(&fr0, &tot0));
@@ -3282,6 +3640,8 @@ int main(int argc, char** argv) {
         const bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= (size_t) (cache_gb * 1073741824.0);
         if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
         g_fast_want = fits && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
+        stage_cold = getenv("IK2_STAGE_COLD") && atoi(getenv("IK2_STAGE_COLD"));
+        g_managed_experts = g_fast_want && g_kv_managed && getenv("IK2_TIER") && atoi(getenv("IK2_TIER"));
         std::printf("experts %.1f GiB, dense weights %.1f GiB as blocks, K / V cache %.1f GiB, %.1f GiB free: %s\n",
                     exp_b / 1073741824.0, dense_b / 1073741824.0, kv_b / 1073741824.0, fr0 / 1073741824.0,
                     fits ? "every expert stays in VRAM" : "the experts in host memory, a cache of them in VRAM");
@@ -3465,13 +3825,17 @@ int main(int argc, char** argv) {
             static const char* mod[4] = {"attn", "k", "v", "mlp"};
             for (int m = 0; m < 4; ++m) {
                 const std::string p = b + "loop_" + mod[m] + "_";
-                Ly.lp_down[m] = load_f32(S, p + "down.weight", (size_t) c.rank * 2 * C);
+                const bool compact = g_fast_want && getenv("IK2_GATE_BF16") && atoi(getenv("IK2_GATE_BF16"));
+                const auto down = host_f32(S, p + "down.weight", (size_t)c.rank * 2 * C);
+                Ly.lp_down[m] = dev_f32(down);
+                if (compact) Ly.lp_bf[m][0] = exact_bf16(down);
                 for (int fg = 0; fg < 2; ++fg) {   // (the file's [C][rank] by rank, [rank][C]: k::loop_gate's layout)
                     const auto w = host_f32(S, p + (fg ? "gain.weight" : "forget.weight"), C * c.rank);
                     std::vector<float> t(w.size());
                     for (size_t ch = 0; ch < C; ++ch)
                         for (int r = 0; r < c.rank; ++r) t[(size_t) r * C + ch] = w[ch * c.rank + r];
                     (fg ? Ly.lp_gain[m] : Ly.lp_forget[m]) = dev_f32(t);
+                    if (compact) Ly.lp_bf[m][fg + 1] = exact_bf16(t);
                 }
             }
             // loop_res_query: rows 2 i (q's) and 2 i + 1 (the MoE's) of core layer i; loop_kv_res_query: k's and v's
@@ -3495,11 +3859,11 @@ int main(int argc, char** argv) {
         use_dev(Ly.dev);
         Vi.kv_cap = Ly.sliding ? std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : ctx;
         if (g_kv_fp8) {
-            Vi.kc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * KD);
-            Vi.vc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * KD);
+            Vi.kc8 = kv_alloc<uint8_t>((size_t)Vi.kv_cap * KD, Ly.sliding);
+            Vi.vc8 = kv_alloc<uint8_t>((size_t)Vi.kv_cap * KD, Ly.sliding);
         } else {
-            Vi.kc = dalloc<uint16_t>((size_t) Vi.kv_cap * KD);
-            Vi.vc = dalloc<uint16_t>((size_t) Vi.kv_cap * KD);
+            Vi.kc = kv_alloc<uint16_t>((size_t)Vi.kv_cap * KD, Ly.sliding);
+            Vi.vc = kv_alloc<uint16_t>((size_t)Vi.kv_cap * KD, Ly.sliding);
         }
         Vi.h_k = dalloc<float>(3 * KD);
         Vi.h_v = dalloc<float>(3 * KD);
@@ -3735,6 +4099,20 @@ int main(int argc, char** argv) {
                     ik2::draft::bytes(drafter) / 1073741824.0, now() - t0);
     }
 
+    if (getenv("IK2_SUFFIX") && n_gpu == 1 && g_fast_want && !drafter)
+        suffix_window = std::min({std::max(0, atoi(getenv("IK2_SUFFIX"))), chunk, 128});
+    if (suffix_window >= 8) {
+        for (auto& v : M.V) {
+            const size_t cc[] = {KD, KD, C, C};
+            for (int j = 0; j < 4; ++j) {
+                v.rec_old[j] = dalloc<float>(3 * cc[j]);
+                v.rec_x[j] = dalloc<float>((size_t)suffix_window * cc[j]);
+            }
+        }
+        std::printf("suffix verification: up to %d inputs per target forward\n", suffix_window);
+    } else
+        suffix_window = 0;
+
     // the work buffers and the expert cache, a set a GPU
     for (int d = 0; d < n_gpu; ++d) {
     use_dev(d);
@@ -3761,6 +4139,8 @@ int main(int argc, char** argv) {
     W.rr = dalloc<float>(Tm * c.H * c.d_rel), W.sink = dalloc<float>(Tm * c.H);
     W.dyn = dalloc<float>(2 * Tm * c.KV * 4);   // (a full layer's dynamic taps: k's, and on the resident path v's beside)
     W.lg_cap = std::max((size_t) 8 * c.H * (size_t) ctx + (size_t) 8 * c.H * 128 * 130, (size_t) 64 << 20);
+    const bool flash_only = g_flash && c.D == 128 && (!getenv("IK2_RELB") || atoi(getenv("IK2_RELB")));
+    if (flash_only && g_fast_want) W.lg_cap = std::max((size_t)64 << 20, (size_t)8 * c.H * 128 * 130);
     W.lg = dalloc<float>(W.lg_cap);
     W.blocks = dalloc<float>((size_t) (c.n_layer / c.block + 1) * T_buf * C);
     W.x16 = dalloc<uint16_t>(Tm * std::max(C, HD)), W.xk16 = dalloc<uint16_t>(Tm * C), W.xv16 = dalloc<uint16_t>(Tm * C);
@@ -3769,7 +4149,7 @@ int main(int argc, char** argv) {
         W.relb_ext = std::max(c.extent, c.extent_swa);
         W.relb = dalloc<float>((size_t) Work::kRelbRows * c.H * W.relb_ext);
     }
-    if (g_kv_fp8) {
+    if (g_kv_fp8 && !(flash_only && g_fast_want)) {
         W.kv_tmp_cap = std::min(ctx, 32768);
         W.kv_k16 = dalloc<uint16_t>((size_t) W.kv_tmp_cap * KD);
         W.kv_v16 = dalloc<uint16_t>((size_t) W.kv_tmp_cap * KD);
@@ -3943,6 +4323,8 @@ int main(int argc, char** argv) {
                 const auto& P = EC.pools[EC.layer_pool[l]];
                 std::vector<const uint8_t*> tab(c.E);
                 for (int e = 0; e < c.E; ++e) tab[e] = P.data + (size_t) EC.loc[(size_t) l * c.E + e] * P.slot_bytes;
+                if (stage_cold)
+                    Ly.tier_cold = dalloc<uint8_t>(c.E);
                 Ly.tab_blob = dalloc<const uint8_t*>(c.E);
                 CU(cudaMemcpy(Ly.tab_blob, tab.data(), (size_t) c.E * sizeof(void*), cudaMemcpyHostToDevice));
                 Ly.tab_h = tab;
@@ -3958,6 +4340,14 @@ int main(int argc, char** argv) {
         }
     }
     std::fflush(stdout);
+    }
+    if (g_managed_experts) {
+        size_t remaining = 0, total = 0;
+        CU(cudaMemGetInfo(&remaining, &total));
+        // An image encoder can start on demand after the engine comes up.
+        const size_t reserve =
+            (size_t)(getenv("IK2_HEADROOM_MIB") ? std::max(0, atoi(getenv("IK2_HEADROOM_MIB"))) : 1536) << 20;
+        g_kv_room = remaining > reserve ? remaining - reserve : 0;
     }
     // the caches' counters, summed over the GPUs
     auto ec_sum = [&](auto f) {
@@ -4212,6 +4602,7 @@ int main(int argc, char** argv) {
             for (auto& v : g_cnt_hist) v = 0;
             for (auto& v : g_src_hist) v = 0;
             bool cancelled = false;
+            if (tier_active && ids.size() - L >= (size_t)2 * chunk) replace_expert_pools(M, false);
             if (L < ids.size()) {
                 const int T_sup = g_dev[0].W.T_sup;
                 const int sub_chunk = std::min(g_dev[0].W.Tm, 512);
@@ -4249,6 +4640,12 @@ int main(int argc, char** argv) {
                         forward(M, ids.data() + p0, n, (int) p0, false, last_c ? OutMode::kLogits : OutMode::kNone,
                                 std::string(), lo, nullptr, t_exp);
                         if (last_c) last = std::move(lo);
+                        if (serve_maya && ids.size() - L > (size_t)chunk) {
+                            const double ms = (now() - t0) * 1e3;
+                            std::printf("PP %zu %zu %.0f %.1f %d\n", p0 + n, ids.size(), ms,
+                                        (p0 + n - L) / std::max(1e-3, ms / 1e3), cached);
+                            std::fflush(stdout);
+                        }
                     }
                 }
             }
@@ -4268,6 +4665,7 @@ int main(int argc, char** argv) {
                 sn.pos = (int) hist.size();
                 snap_copy(sn, true);
             }
+            place_decode(M, (int)ids.size());
             const double t1 = now();
             if (getenv("IK2_STATS"))
                 std::printf("prefill stats: %zu tokens run, %llu expert copies (%.1f GiB) in %.2f s; experts that ran 1 / 2 / 3-7 / 8+ "
@@ -4328,12 +4726,25 @@ int main(int argc, char** argv) {
             const char* reason = "length";
             int n_out = 0;
             int greedy_tok = temp <= 0 && !last.empty() ? pick(last.data()) : -1;
+            int pending_sample = -1;
+            const RowSampler suffix_sample = temp > 0 ? RowSampler(pick) : RowSampler{};
+            int suffix_at = 0;
+            SuffixStats suffix_stats;
+            size_t next_placement = hist.size() + kPlacementInterval;
             for (int i = 0; i < max_new; ++i) {
+                if (g_managed_experts && hist.size() >= next_placement) {
+                    place_decode(M, (int)hist.size());
+                    next_placement = hist.size() + kPlacementInterval;
+                }
                 if (g_cancel) {
                     reason = "cancelled";
                     break;
                 }
-                const int tok = temp <= 0 ? greedy_tok : cand ? pick_cand() : pick(last.data());
+                const int tok = temp <= 0             ? greedy_tok
+                                : pending_sample >= 0 ? pending_sample
+                                : cand                ? pick_cand()
+                                                      : pick(last.data());
+                pending_sample = -1;
                 ++n_out;
                 std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", tok);
                 std::fflush(stdout);
@@ -4342,6 +4753,34 @@ int main(int argc, char** argv) {
                     break;
                 }
                 if (i + 1 == max_new) break;
+                if (suffix_window && i >= suffix_at) {
+                    std::vector<int> next;
+                    const int n =
+                        verify_suffix(M, hist, tok, max_new - i - 1, stops, next, t_exp, suffix_stats, suffix_sample);
+                    if (n) {
+                        hist.push_back(tok);
+                        if (g_cancel) {
+                            if (n > 1) rollback(M, 1);
+                            last.clear();
+                            reason = "cancelled";
+                            break;
+                        }
+                        for (int j = 0; j < n - 1; ++j) {
+                            std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", next[j]);
+                            hist.push_back(next[j]);
+                        }
+                        std::fflush(stdout);
+                        n_out += n - 1;
+                        i += n - 1;
+                        if (temp <= 0)
+                            greedy_tok = next.back();
+                        else
+                            pending_sample = next.back();
+                        last.clear();
+                        if (n < 8) suffix_at = i + 16;
+                        continue;
+                    }
+                }
                 if (temp <= 0) {
                     std::vector<float> lo;
                     std::vector<int> ag;
@@ -4357,9 +4796,13 @@ int main(int argc, char** argv) {
                 }
                 hist.push_back(tok);
             }
+            if (suffix_stats.forwards)
+                std::fprintf(stderr, "suffix: %d target forwards verified %d inputs, accepted %d/%d proposals\n",
+                             suffix_stats.forwards, suffix_stats.inputs, suffix_stats.accepted, suffix_stats.offered);
             if (serve_maya)
-                std::printf("DONE %d %zu %.1f %.1f %s 0 0 %d\n", n_out, ids.size(), (t1 - t0) * 1e3, (now() - t1) * 1e3,
-                            std::strcmp(reason, "cancelled") == 0 ? "cancel" : reason, cached);
+                std::printf("DONE %d %zu %.1f %.1f %s %d %d %d\n", n_out, ids.size(), (t1 - t0) * 1e3,
+                            (now() - t1) * 1e3, std::strcmp(reason, "cancelled") == 0 ? "cancel" : reason,
+                            suffix_stats.accepted, suffix_stats.offered, cached);
             else
                 std::printf("@END %s %zu %d %.3f %.3f\n", reason, ids.size(), cached, t1 - t0, now() - t1);
             std::fflush(stdout);
@@ -4432,6 +4875,7 @@ int main(int argc, char** argv) {
         first_best = (int) (std::max_element(r_last, r_last + c.n_vocab) - r_last);
         logits.clear();
     }
+    if (gen) place_decode(M, (int)prompt.size());
     // greedy generation
     g_pf = Prof{};
     std::vector<int> out;
@@ -4457,13 +4901,40 @@ int main(int argc, char** argv) {
     // IK2_LOGITS_OUT=FILE: every generated token's logits [n_vocab] F32 appended there (with IK2_FORCE: two builds'
     // logits over the same tokens, to compare)
     FILE* lo = getenv("IK2_LOGITS_OUT") ? std::fopen(getenv("IK2_LOGITS_OUT"), "wb") : nullptr;
+    const bool use_suffix = suffix_window && !lo && force.empty() && !drafter;
+    std::vector<int> suffix_hist;
+    if (use_suffix) suffix_hist = prompt;
+    int suffix_at = 0;
+    SuffixStats suffix_stats;
+    int next_placement = kPlacementInterval;
     for (int i = 0, best = first_best; i < gen && !drafter; ++i) {
+        if (g_managed_experts && i >= next_placement) {
+            place_decode(M, (int)prompt.size() + i);
+            next_placement = i + kPlacementInterval;
+        }
         const int tok = i < (int) force.size() ? force[i] : best;
         if (i < (int) force.size()) agree += best == force[i];
         out.push_back(tok);
         std::printf("%d%s", tok, i + 1 < gen ? "," : "\n");
         std::fflush(stdout);
         if (i + 1 == gen) break;
+        if (use_suffix) {
+            std::vector<int> next;
+            const int n =
+                i < suffix_at ? 0 : verify_suffix(M, suffix_hist, tok, gen - i - 1, {}, next, t_exp, suffix_stats);
+            suffix_hist.push_back(tok);
+            if (n) {
+                for (int j = 0; j < n - 1; ++j) {
+                    out.push_back(next[j]);
+                    suffix_hist.push_back(next[j]);
+                    std::printf("%d,", next[j]);
+                }
+                i += n - 1;
+                best = next.back();
+                if (n < 8) suffix_at = i + 16;
+                continue;
+            }
+        }
         std::vector<int> ag;
         if (lo) logits.clear();
         forward(M, &tok, 1, (int) prompt.size() + i, false, lo ? OutMode::kLogits : OutMode::kArgmax, std::string(),
@@ -4481,6 +4952,9 @@ int main(int argc, char** argv) {
                     (int) std::min<size_t>(force.size(), out.size()), agree,
                     100.0 * agree / std::max<size_t>(1, std::min<size_t>(force.size(), out.size())));
 
+    if (suffix_stats.forwards)
+        std::fprintf(stderr, "suffix: %d target forwards verified %d inputs, accepted %d/%d proposals\n",
+                     suffix_stats.forwards, suffix_stats.inputs, suffix_stats.accepted, suffix_stats.offered);
     if (drafter) {
         // draft 7 after the anchor, verify the 8 in one call, keep the agreeing prefix and the target's next token
         float *raw = dalloc<float>(c.C), *anchor_h = dalloc<float>(c.C);

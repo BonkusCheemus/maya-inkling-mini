@@ -281,8 +281,11 @@ To run it (one GPU):
     python tools/strata_tokenizer.py --gguf Inkling-2-Mini-UD-Q4_K_XL.gguf --out ik2 \
         --chat-template tools/ik2/chat_template.jinja --check
     cat > ik2-mini.json <<EOF
-    {"exe": "build/maya-ik2", "args": ["--model", "Inkling-2-Mini-UD-Q4_K_XL.gguf", "--max-context", "262144"],
-     "env": {"IK2_KV": "fp8"}, "tokenizer": "ik2/tokenizer", "model_name": "inkling-2-mini",
+    {"exe": "build/maya-ik2", "args": ["--model", "Inkling-2-Mini-UD-Q4_K_XL.gguf", "--max-context", "1048576"],
+     "env": {"IK2_KV": "fp8", "IK2_KV_MANAGED": "1", "IK2_TIER": "1", "IK2_EXPERT_LIMB": "0",
+             "IK2_GATE_BF16": "1", "IK2_GATE_TILE": "64", "IK2_Q8_UNROLL": "1", "IK2_Q8_TILE": "1",
+             "IK2_GROUP_MMA": "3", "IK2_VERIFY_ONLY": "1", "IK2_SUFFIX": "96", "IK2_BATCH_PREFILL": "1",
+             "IK2_STAGE_COLD": "1", "IK2_HEADROOM_MIB": "384"}, "tokenizer": "ik2/tokenizer", "model_name": "inkling-2-mini",
      "vision": {"exe": "build-vision/bin/maya-vision", "mmproj": "mmproj-BF16.gguf",
                 "model": "Inkling-2-Mini-UD-Q4_K_XL.gguf", "gpu": true, "resident": true}}
     EOF
@@ -293,3 +296,34 @@ the model has no switch for its thinking, only the effort level, and at the lowe
 
 Not done: two GPUs and the drafter with a loop (the engine refuses them), the loop in the layer-major prompt
 passes (`IK2_SUP`: off for a looped model), a second card for the KV cache (a million tokens is 16 GiB of it).
+
+
+### Native context on one 24 GiB Ampere GPU
+
+The Mini example reserves 1,048,576 token positions including the output. All eight global attention visits retain
+the entire prefix. The other forty use the model's sliding window. With a resident vision encoder, check the picture
+and an early text sentinel in the same cold request to test the deployed configuration.
+
+- `IK2_KV_MANAGED=1` reserves global K and V in unified memory. Physical memory follows the live prefix. Large prefill
+  chunks prefetch each global visit before attention. `IK2_TIER=1` gives deep decode additional VRAM by backing the
+  least-used expert groups with host memory. Large fresh prefills restore ordinary GPU expert storage. With `IK2_STAGE_COLD=1`, the routed host weights
+  enter the attention scratch space in coalesced reads before the expert products. `IK2_HEADROOM_MIB` reserves
+  capacity beyond the allocations present at startup. The example uses 384 MiB because its vision encoder has
+  already warmed up. The default is 1536 MiB.
+- The serving profile preserves the reference scalar expert math with `IK2_EXPERT_LIMB=0`. The experimental value
+  `IK2_EXPERT_LIMB=15` uses two signed-byte activation limbs and DP4A for NVFP4 and Q8_0 gate/up and down products
+  in single-token decode. The GGUF weights are unchanged. Activation rounding and reduction order can affect logits.
+  The low four flag bits enable NVFP4 gate/up, NVFP4 down, Q8 gate/up and Q8 down respectively.
+- `IK2_GATE_BF16=1` checks the F32 loop-gate weights for exact BF16 representation before creating the compact copy
+  used by single-token decode. `IK2_GATE_TILE=64` and `IK2_Q8_UNROLL=1` select tuned launch and reduction shapes.
+- `IK2_Q8_TILE=1` uses a tensor-core product for short dense projections. `IK2_GROUP_MMA=3` groups up to eight token
+  inputs per expert for gate/up and down. With `IK2_BATCH_PREFILL=1`, cold prefill gathers all routed token rows once,
+  batches the SwiGLU and sums the down projections in the same expert order. It reuses attention scratch space.
+  Every input token runs through all its scheduled visits. With `IK2_VERIFY_ONLY=1`, the short tensor-core
+  projections run only on target verification batches. Ordinary prompts retain their original product kernels.
+- `IK2_SUFFIX=96` proposes copies from the preceding 65,536 tokens of this request. Every emitted token is selected by
+  the target, including at positive temperature. A mismatch rolls the short convolutions back to the committed prefix.
+  Code edits with a long exact substring can therefore decode considerably faster than fresh prose.
+
+For a comparison against the scalar expert math, omit the expert, loop-gate, tensor-core tile and suffix overrides.
+Keep the same KV dtype and inputs when comparing numerical drift.
