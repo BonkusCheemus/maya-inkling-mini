@@ -30,30 +30,17 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <fcntl.h>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#include <io.h>
-#define O_RDONLY (_O_RDONLY | _O_BINARY)
-#define open _open
-#define close _close
-typedef SSIZE_T ssize_t;
-#define off_t int64_t
-static inline ssize_t pread(int fd, void* buf, size_t count, int64_t offset) {
-    if (_lseeki64(fd, offset, SEEK_SET) == -1) return -1;
-    return _read(fd, buf, (unsigned int)count);
-}
-#define posix_fadvise(fd, off, len, adv) ((void)0)
-#define MADV_WILLNEED 0
-static inline int madvise(void*, size_t, int) { return 0; }
-static inline int munmap(void*, size_t) { return 0; }
-#ifndef SIGUSR1
-#define SIGUSR1 30
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #else
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -731,6 +718,23 @@ uint16_t* load_f16(const Shards& S, const std::string& n, size_t expect) { retur
 
 // ---- loading the experts into pinned host memory: pread from the files, several at once
 
+#ifdef _WIN32
+inline void* ik2_anon_alloc(size_t bytes) {
+    return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+}
+inline void ik2_anon_free(void* p, size_t) {
+    if (p) VirtualFree(p, 0, MEM_RELEASE);
+}
+#else
+inline void* ik2_anon_alloc(size_t bytes) {
+    void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? nullptr : p;
+}
+inline void ik2_anon_free(void* p, size_t bytes) {
+    if (p) ::munmap(p, bytes);
+}
+#endif
+
 struct Pinned {
     struct Block {
         void* ptr = nullptr;
@@ -743,7 +747,7 @@ struct Pinned {
         for (const auto& b : blocks) {
             if (b.mapped) {
                 if (b.registered) cudaHostUnregister(b.ptr);
-                ::munmap(b.ptr, b.bytes);
+                ik2_anon_free(b.ptr, b.bytes);
             } else if (b.ptr) {
                 cudaFreeHost(b.ptr);
             }
@@ -753,6 +757,31 @@ struct Pinned {
 
 void read_into_strided(const std::string& path, uint64_t off, int n_exp, size_t exp_bytes, size_t dst_stride,
                        uint8_t* dst) {
+#ifdef _WIN32
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) die("cannot open " + path);
+    const size_t chunk = 64ull << 20;
+    for (int e = 0; e < n_exp; ++e) {
+        size_t done = 0;
+        uint8_t* ep = dst + (size_t) e * dst_stride;
+        const uint64_t eoff = off + (uint64_t) e * exp_bytes;
+        while (done < exp_bytes) {
+            const DWORD want = (DWORD) std::min(chunk, exp_bytes - done);
+            OVERLAPPED ov{};
+            const uint64_t pos = eoff + done;
+            ov.Offset = (DWORD) (pos & 0xFFFFFFFFull);
+            ov.OffsetHigh = (DWORD) (pos >> 32);
+            DWORD got = 0;
+            if (!ReadFile(h, ep + done, want, &got, &ov) || got == 0) {
+                CloseHandle(h);
+                die("read failed: " + path);
+            }
+            done += (size_t) got;
+        }
+    }
+    CloseHandle(h);
+#else
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) die("cannot open " + path);
     const size_t chunk = 64ull << 20;
@@ -768,6 +797,7 @@ void read_into_strided(const std::string& path, uint64_t off, int n_exp, size_t 
     }
     posix_fadvise(fd, (off_t) off, (off_t) ((uint64_t) n_exp * exp_bytes), POSIX_FADV_DONTNEED);
     ::close(fd);
+#endif
 }
 
 // ---- the expert cache in VRAM: per-size-class pools, O(1) S3-FIFO with ghost history
@@ -4610,7 +4640,13 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < J.roles.size(); ++i) Ly.host[J.roles[i]] = p + i * Ly.eb[J.roles[i]];
             {   // (read ahead: a cold file otherwise comes in a page fault at a time)
                 const size_t pg = 4096, a0 = (size_t) p & ~(pg - 1);
-                ::madvise((void*) a0, (size_t) p - a0 + tensor_bytes(*S.info(J.name)), MADV_WILLNEED);
+                const size_t len = (size_t) p - a0 + tensor_bytes(*S.info(J.name));
+#ifdef _WIN32
+                WIN32_MEMORY_RANGE_ENTRY entry{(void*) a0, len};
+                PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+#else
+                ::madvise((void*) a0, len, MADV_WILLNEED);
+#endif
             }
         }
         std::printf("experts: read where the files are mapped (IK2_HOST=mmap)\n");
@@ -4619,12 +4655,11 @@ int main(int argc, char** argv) {
         // Pinned host memory: anonymous mappings read into and then registered with CUDA, a layer as soon as its
         // reads are done (323 GiB in ~60 s from VAST); IK2_ALLOC=hostalloc: cudaHostAlloc instead, which pins at
         // ~3 GiB/s (the driver serializes it; 110-190 s)
-#ifndef _WIN32
         bool use_mmap_reg = !(getenv("IK2_ALLOC") && std::string(getenv("IK2_ALLOC")) == "hostalloc");
         if (use_mmap_reg) {
             const size_t probe_bytes = 2ULL << 20;
-            void* mp = ::mmap(nullptr, probe_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (mp == MAP_FAILED) {
+            void* mp = ik2_anon_alloc(probe_bytes);
+            if (!mp) {
                 use_mmap_reg = false;
             } else {
                 *((volatile uint8_t*) mp) = 0;
@@ -4634,7 +4669,7 @@ int main(int argc, char** argv) {
                 } else {
                     CU(cudaHostUnregister(mp));
                 }
-                ::munmap(mp, probe_bytes);
+                ik2_anon_free(mp, probe_bytes);
             }
         }
         pin.blocks.resize(c.n_layer);
@@ -4643,9 +4678,9 @@ int main(int argc, char** argv) {
                 const Layer& Ly = M.L[l];
                 const size_t slot_bytes = Ly.eb[0] + Ly.eb[1] + Ly.eb[2];
                 const size_t layer_bytes = (size_t) c.E * slot_bytes;
-                void* p = ::mmap(nullptr, layer_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                if (p == MAP_FAILED) {
-                    for (int k = 0; k < l; ++k) ::munmap(pin.blocks[k].ptr, pin.blocks[k].bytes);
+                void* p = ik2_anon_alloc(layer_bytes);
+                if (!p) {
+                    for (int k = 0; k < l; ++k) ik2_anon_free(pin.blocks[k].ptr, pin.blocks[k].bytes);
                     pin.blocks.assign(c.n_layer, {});
                     use_mmap_reg = false;
                     break;
@@ -4653,10 +4688,6 @@ int main(int argc, char** argv) {
                 pin.blocks[l] = {p, layer_bytes, true, false};
             }
         }
-#else
-        bool use_mmap_reg = false;
-        pin.blocks.resize(c.n_layer);
-#endif
         // (pinned: the allocations and the reads overlap - a layer's reads start as soon as its buffer exists;
         // IK2_ALLOC_THREADS threads allocate, default 1)
         std::vector<std::atomic<int>> ready(c.n_layer);
@@ -5175,7 +5206,9 @@ int main(int argc, char** argv) {
             }
             return v;
         };
+#ifdef SIGUSR1
         std::signal(SIGUSR1, on_usr1);
+#endif
         // Maya's protocol (serve/server.py's StrataEngine): "GEN <max_new> [key=value ...] <ids>" in; "PP ..." per
         // prompt pass, "T <id>" per token and "DONE <generated> <prompt> <prompt_ms> <decode_ms> <stop|length|cancel>
         // 0 0 <reused>" out; "STOP" mid-request ends it at the next token (or between the prompt's passes), "QUIT"
