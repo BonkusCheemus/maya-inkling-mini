@@ -327,3 +327,19 @@ and an early text sentinel in the same cold request to test the deployed configu
 
 For a comparison against the scalar expert math, omit the expert, loop-gate, tensor-core tile and suffix overrides.
 Keep the same KV dtype and inputs when comparing numerical drift.
+
+### Deep decode on an AVX2 host
+
+On the one-card Mini path, `IK2_DEEP_CPU_THREADS=24` enables host expert products from
+`IK2_DEEP_CPU_MIN=524288` live tokens when the populated global KV needs room. The engine assigns complete layers
+to the host in ascending order of visits per byte of expert weights. Q8_0 layers and layers outside the repeated
+core are inexpensive to move. Expert selection, SwiGLU, FP16 hidden rounding, attention and the output head still
+run on the GPU. AVX2 processes eight output rows together while preserving the sm_86 sub-block and warp reduction
+order. The optional build needs OpenMP, AVX2, F16C and FMA. Leave the thread count unset to use GPU staging alone.
+The CPU keeps packed copies of selected layers in host RAM until the engine exits. A layer is packed once per process.
+Use `OMP_WAIT_POLICY=PASSIVE` for a service that can be idle.
+
+With `IK2_PARK_WORK=1` the engine can move large unused tails of prefill work buffers to RAM before deep decode.
+It restores them before a large fresh prefill. The established short path keeps the full expert pool resident.
+An RTX 3090 uses a four-nibble signed lookup for the same FP16 NVFP4 values used by the scalar products.
+The HTTP frontend permits the final position when the backend identifies itself as `ik2`.

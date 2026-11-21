@@ -2910,6 +2910,12 @@ class Service:
         with self.status_lock:
             return bool(self.reload) and self.reload.get("state") in ("waiting", "running")
 
+    def context_room(self, prompt_tokens: int) -> int:
+        """The Inkling engine accepts the final position. Strata reserves eight slots."""
+        info = getattr(self.engine, "info", {}) or {}
+        slack = 0 if info.get("engine_kind") == "ik2" else CTX_SLACK
+        return self.engine.max_context - slack - prompt_tokens
+
     def context_limits(self) -> dict:
         """The dashboard's Context size: the range it offers and the engine's measured cost of the current one."""
         info = dict(getattr(self.engine, "info", {}) or {})
@@ -3913,7 +3919,7 @@ class Service:
             self.embeddings.path = combined
         if self.engine.max_context <= 0:   # (a reload / /models/load: the start has not reported its context yet)
             raise BadBody(503, "the model is starting; try again in a moment")
-        room = self.engine.max_context - CTX_SLACK - len(ids)
+        room = self.context_room(len(ids))
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
                 raise ContextOverflow(f"maximum context length is {self.engine.max_context} tokens; prompt "
@@ -4700,7 +4706,7 @@ class Service:
                     does not count: the context's room caps it too (with an unlimited max_new, prepare's room, the
                     engine rejected prompt + max_new + CTX_SLACK > context)."""
                     while True:
-                        room = self.engine.max_context - CTX_SLACK - len(seg["prompt"])
+                        room = self.context_room(len(seg["prompt"]))
                         l0 = getattr(self.engine, "last", None)
                         yield from attempts(seg["prompt"], max(1, min(max_new - n, room)))
                         got = getattr(self.engine, "last", None)

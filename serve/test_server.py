@@ -190,6 +190,14 @@ class MaxTokens(unittest.TestCase):
         u = b.get("usage", {})
         return s, b, u.get("input_tokens"), u.get("output_tokens")
 
+    def test_inkling_accepts_the_last_context_position(self):
+        from unittest.mock import patch
+        with patch.object(self.engine, "info", {"engine_kind": "ik2"}, create=True):
+            status, _, prompt, _ = self.call("openai", max_tokens=1)
+            self.assertEqual(status, 200)
+            self.assertEqual(self.call("openai", max_tokens=CTX - prompt)[0], 200)
+            self.assertEqual(self.call("openai", max_tokens=CTX - prompt + 1)[0], 400)
+
     def test_unset_budget_is_the_rest_of_the_context(self):
         cases = {"openai": [{"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None},
                             {"max_completion_tokens": -1}, {"max_completion_tokens": None, "max_tokens": None}],

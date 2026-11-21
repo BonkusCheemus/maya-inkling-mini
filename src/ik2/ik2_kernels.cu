@@ -2061,6 +2061,27 @@ __device__ __forceinline__ float2 e2m1_pair_hi(uint32_t s) {
     return u32_to_f2(__byte_perm(0x42403c00u, 0x4a484644u, sel) | sgn);
 }
 
+// Four signed FP16 high bytes in the order of the serialized E2M1 nibbles.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
+__device__ __forceinline__ uint32_t decode_signed_nibbles(uint32_t nib) {
+    const uint32_t p = __byte_perm(0x42403c00u, 0x4a484644u, nib);
+    const uint32_t n = __byte_perm(0xc2c0bc80u, 0xcac8c6c4u, nib);
+    return __byte_perm(p, n, 0x3210u | ((nib & 0x8888u) >> 1));
+}
+__device__ __forceinline__ float nvfp4_sub_dot(uint32_t q0, uint32_t q1, float4 x0, float4 x1, float4 x2, float4 x3) {
+    const uint32_t a = decode_signed_nibbles(q0), b = decode_signed_nibbles(q0 >> 16);
+    const uint32_t c = decode_signed_nibbles(q1), d = decode_signed_nibbles(q1 >> 16);
+
+    const auto v01 = u32_to_f2(__byte_perm(0, a, 0x6040)), v23 = u32_to_f2(__byte_perm(0, b, 0x6040));
+    const auto v45 = u32_to_f2(__byte_perm(0, c, 0x6040)), v67 = u32_to_f2(__byte_perm(0, d, 0x6040));
+    const auto v89 = u32_to_f2(__byte_perm(0, a, 0x7050)), vAB = u32_to_f2(__byte_perm(0, b, 0x7050));
+    const auto vCD = u32_to_f2(__byte_perm(0, c, 0x7050)), vEF = u32_to_f2(__byte_perm(0, d, 0x7050));
+    return (v01.x * x0.x + v01.y * x0.y + v23.x * x0.z + v23.y * x0.w) +
+           (v45.x * x1.x + v45.y * x1.y + v67.x * x1.z + v67.y * x1.w) +
+           (v89.x * x2.x + v89.y * x2.y + vAB.x * x2.z + vAB.y * x2.w) +
+           (vCD.x * x3.x + vCD.y * x3.y + vEF.x * x3.z + vEF.y * x3.w);
+}
+#else
 __device__ __forceinline__ float nvfp4_sub_dot(uint32_t q0, uint32_t q1, float4 x0, float4 x1, float4 x2, float4 x3) {
     const float2 w01 = e2m1_pair_lo(q0), w23 = e2m1_pair_lo(q0 >> 16);
     const float2 w45 = e2m1_pair_lo(q1), w67 = e2m1_pair_lo(q1 >> 16);
@@ -2071,6 +2092,7 @@ __device__ __forceinline__ float nvfp4_sub_dot(uint32_t q0, uint32_t q1, float4 
            (w89.x * x2.x + w89.y * x2.y + wAB.x * x2.z + wAB.y * x2.w) +
            (wCD.x * x3.x + wCD.y * x3.y + wEF.x * x3.z + wEF.y * x3.w);
 }
+#endif
 
 __device__ __forceinline__ float dot_u32_f4(uint32_t q4, float4 f) {
     return (float) (int8_t) (q4 & 0xFFu) * f.x +
