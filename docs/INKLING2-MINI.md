@@ -61,7 +61,7 @@ To pick the card, set `CUDA_VISIBLE_DEVICES` before the command.
 
 ## Configs
 
-All 4 are in [`docs/inkling2-mini/`](inkling2-mini/).
+All 4 are in [`docs/inkling2-mini/`](inkling2-mini/). For a card with 8 GB, see [An 8 GB card](#an-8-gb-card).
 
 | Config | Context | Drafter | Image encoder | VRAM |
 |---|---:|---|---|---:|
@@ -130,6 +130,21 @@ Through the server new code runs at 182 to 207 tok/s greedy and about 205 at tem
 llama.cpp `b12590` with the Inkling 2 pull requests, same card and file: 57.0 tok/s decode and 1,052 tok/s prefill of 4,096 tokens; 65,536 tokens deep 42.7 and 630.
 
 Decode slows down with depth for a physical reason. 8 of the 48 layer visits attend over the full prefix, so every new token reads 16 KB of cache per token of context: 5.4 GB at 340K, on top of the 3.7 GB of weights.
+
+## An 8 GB card
+
+[`ik2-mini-8gb.json`](inkling2-mini/ik2-mini-8gb.json) runs the same file on a card that holds a quarter of the experts. The experts stay in pinned host memory (14.7 GiB of RAM), the GPU keeps a 3.8 GiB cache of them, and the CPU computes each missing expert from host memory while the GPU runs the cached ones. Measured on a laptop with an RTX 5070 Laptop GPU (8 GB, PCIe 4.0 x8), a Ryzen 9 270 (AVX-512) and DDR5 that reads at 58 GB/s: 40 to 43 tok/s through the server on five chat prompts of 500 to 600 tokens, at a 16,384 token context. llama.cpp with its experts on the CPU gets 12.5 tok/s on the same laptop.
+
+| Setting | What it does |
+|---|---|
+| `IK2_ROOM_MIB=256` | The VRAM left free beside the cache: 256 MiB instead of 2 GiB |
+| `IK2_DENSE=q8` | The dense weights as the GGUF's Q8_0 blocks: half the VRAM of the FP16 copy, which leaves more room for the cache |
+| `IK2_UP_MS=5` | A copy over PCIe priced so high that the CPU computes every miss. A narrow link stalls the GPU on each copy |
+| `IK2_CPU_Q8=1` | The CPU computes the Q8_0 experts of layers 20 to 23 too. Without it, a miss there waits for an 8 MB copy |
+| `IK2_LAZY_CPU=1` | An expert still arriving from a background copy goes to the CPU, so the GPU does not wait for it |
+| `IK2_LAZY_MAX=2`, `IK2_LAZY_PER=1` | At most 2 background copies in flight and 1 started per layer visit. The cache still follows the text: 84% hits against 49% with no copies |
+
+The limits on that laptop: the CPU computes a miss at 37 to 41 GB/s of the 58 GB/s the RAM gives, and the GPU kernels of a token take about 15 ms. A longer context leaves less VRAM for the cache, so 32,768 tokens give about 36 tok/s and 65,536 about 32.
 
 ## How it works
 

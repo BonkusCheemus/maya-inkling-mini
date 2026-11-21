@@ -308,8 +308,16 @@ bool g_overlap = true;      // IK2_OVERLAP=0: the copies on the compute stream, 
 // The CPU lane (IK2_CPU=1: on): a missing NVFP4 expert computed in host memory by the pool while the others' blocks
 // are copied; its own blocks follow on the copy stream without being waited for ("lazy"), so it is in VRAM next time.
 ik2::cpu::Pool* g_pool = nullptr;
-double g_t_cpu = 0.5e-3, g_t_up = 0.36e-3;   // seconds an expert: the pool's (measured as it runs), the link's
+double g_t_cpu_f[2] = {0.5e-3, 1.0e-3};   // seconds an expert on the pool, NVFP4 and Q8_0 (measured as it runs)
+double& g_t_cpu = g_t_cpu_f[0];
+bool g_cpu_q8 = false;                     // IK2_CPU_Q8=1: Q8_0 experts on the CPU lane too
+double g_t_up = 0.36e-3;   // seconds an expert: the pool's (measured as it runs), the link's
 uint64_t g_n_cpu = 0, g_n_wait = 0;
+double g_cpu_busy = 0;   // the CPU lane's batches: their time in all, how many
+long g_cpu_batches = 0;
+bool g_lazy_cpu = false;   // IK2_LAZY_CPU=1: an expert still arriving from a lazy copy computed on the CPU
+int g_lazy_max = 0, g_lazy_per = 0;   // IK2_LAZY_MAX, IK2_LAZY_PER: lazy batches in flight, lazy copies a call (0: any)
+cudaStream_t g_ls = nullptr;          // IK2_LAZY_STREAM=1: lazy copies on their own stream
 bool g_cpu_lazy = true;   // IK2_CPU_LAZY=0: a CPU-computed expert is not copied in afterwards (the link carries less)
 constexpr int kRing = 256;
 cudaEvent_t g_ring[kRing];                   // a lazy batch's end on the copy stream, by sequence number
@@ -935,6 +943,7 @@ struct ExpertCache {
             if (s >= 0) return s;
             if (attempt == 0 && saw_busy_lazy) {
                 CU(cudaStreamSynchronize(g_cs));
+                if (g_ls) CU(cudaStreamSynchronize(g_ls));
                 g_seq_done = g_seq_next - 1;
                 continue;
             }
@@ -1811,6 +1820,7 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
     const double te0 = now();
     if (g_seq_done + 1 < g_seq_next) {
         CU(cudaStreamSynchronize(g_cs));
+        if (g_ls) CU(cudaStreamSynchronize(g_ls));
         g_seq_done = g_seq_next - 1;
     }
     std::fill(W.cnt.begin(), W.cnt.end(), 0);
@@ -3129,8 +3139,12 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         float* rw = (float*) (W.route_d + S);
         k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
         CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
-        const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= 8 && Ly.ty[0] == k::kNVFP4 &&
-                              Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4;
+        // (Q8_0 experts too with IK2_CPU_Q8=1: the last layers of unsloth's UD-Q4_K_XL)
+        const bool lane_q8 = g_cpu_q8 && Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0 && Ly.ty[2] == k::kQ8_0;
+        const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= 8 &&
+                              (lane_q8 || (Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4));
+        double& t_cpu = g_t_cpu_f[lane_q8 ? 1 : 0];
+        const double t_up = lane_q8 ? g_t_up * (34.0 / 32.0) / (36.0 / 64.0) : g_t_up;   // (the blocks' bytes a value)
         if (cpu_lane) CU(cudaMemcpyAsync(W.x_h, W.xq, TC * 4, cudaMemcpyDeviceToHost, g_s));
         CU(cudaStreamSynchronize(g_s));
         const int* top = W.route_h;
@@ -3430,13 +3444,21 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 if (EC.has(l, e)) {
                     where[i] = EC.get(Ly, l, e, tick, cst, nullptr, false, false);
                     slot_of[i] = EC.last_handle;
-                    if (EC.slot_sseq(EC.last_handle) > g_seq_done) late[i] = 1;   // still arriving from a lazy copy
+                    if (EC.slot_sseq(EC.last_handle) > g_seq_done) {   // still arriving from a lazy copy
+                        // (IK2_LAZY_CPU=1: the CPU computes it from host memory instead of the GPU waiting)
+                        if (cpu_lane && g_lazy_cpu) late[i] = 2, acc_cpu += t_cpu;
+                        else late[i] = 1;
+                    }
                     continue;
                 }
                 // a miss: the CPU's or the link's, whichever is free first
-                if (cpu_lane && acc_cpu + g_t_cpu <= acc_up + g_t_up) {
-                    late[i] = 2, acc_cpu += g_t_cpu;
-                    if (g_cpu_lazy) {   // a slot for its blocks, copied in afterwards
+                if (cpu_lane && acc_cpu + t_cpu <= acc_up + t_up) {
+                    late[i] = 2, acc_cpu += t_cpu;
+                    // (IK2_LAZY_MAX / IK2_LAZY_PER: at most that many lazy batches in flight and copies a call, so
+                    //  a narrow link is not queued up with them; past either the expert is only computed)
+                    const bool lazy_ok = g_cpu_lazy && (g_lazy_max <= 0 || (int) (g_seq_next - 1 - g_seq_done) < g_lazy_max) &&
+                                         (g_lazy_per <= 0 || n_lazy < g_lazy_per);
+                    if (lazy_ok) {   // a slot for its blocks, copied in afterwards
                         where[i] = EC.get(Ly, l, e, tick, cst, nullptr, false, false);
                         slot_of[i] = EC.last_handle;
                         lazy[n_lazy++] = i;
@@ -3445,7 +3467,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                         where[i] = nullptr, slot_of[i] = -1;
                     }
                 } else {
-                    late[i] = 1, acc_up += g_t_up;
+                    late[i] = 1, acc_up += t_up;
                     where[i] = EC.get(Ly, l, e, tick, cst, nullptr, false, false);
                     slot_of[i] = EC.last_handle;
                     urgent[n_urgent++] = i;
@@ -3464,14 +3486,16 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 const uint64_t seq = g_seq_next++;
                 if (seq > g_seq_done + kRing - 1) {   // the ring's entry is still an unfinished batch's
                     CU(cudaStreamSynchronize(g_cs));
+                    if (g_ls) CU(cudaStreamSynchronize(g_ls));
                     g_seq_done = seq - 1;
                 }
+                const cudaStream_t lst = g_ls ? g_ls : g_cs;   // (IK2_LAZY_STREAM=1: a stream of their own)
                 for (int li = 0; li < n_lazy; ++li) {
                     const int i = lazy[li];
-                    EC.copy_in(Ly, top[i], (uint8_t*) where[i], g_cs);
+                    EC.copy_in(Ly, top[i], (uint8_t*) where[i], lst);
                     EC.slot_sseq(slot_of[i]) = seq;
                 }
-                CU(cudaEventRecord(g_ring[seq % kRing], g_cs));
+                CU(cudaEventRecord(g_ring[seq % kRing], lst));
             }
             const int ps = W.pack_slot;
             W.pack_slot = (W.pack_slot + 1) % Work::kPackRing;
@@ -3497,6 +3521,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     J.down = Ly.host[2] + (size_t) e * Ly.stride[2];
                     J.x = W.x_h + (size_t) (i / c.K) * C;
                     J.sg = sg[p], J.su = su[p];
+                    J.q8 = lane_q8;
                     J.y = yh + (size_t) (p - nh - nw) * C;
                     ik2::cpu::post_expert(*g_pool, &J, C, c.F, c.gate_cap, c.up_cap);
                 }
@@ -3560,10 +3585,21 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             const float* psu = (const float*) (pk_d + 1280);
             const float* pwt = (const float*) (pk_d + 1536);
             const int F = c.F;
+            // (one token: its NVFP4 experts on the tensor cores, as the resident path runs them; IK2_EXPERT_MMA=0: no)
+            static const int exp_mma_c = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
+            const bool tc = exp_mma_c && T == 1 && nh + nw > 0 && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, F);
+            if (tc) k::to_f16_limbs(W.xq, C, (uint16_t*) W.gu32, g_s);
             for (int part = 0; part < 2; ++part) {
                 const int p0 = part ? nh : 0, n = part ? nw : nh;
                 if (part && cst != g_s) CU(cudaStreamWaitEvent(g_s, g_ev, 0));
                 if (!n) continue;
+                if (tc) {
+                    k::experts_gate_up_swiglu_mma(pb + p0, n, Ly.eb[0], (const uint16_t*) W.gu32, C, F, psg + p0,
+                                                  psu + p0, c.gate_cap, c.up_cap, W.h16 + (size_t) p0 * F, g_s);
+                    k::experts_down_mma(pb + p0, n, Ly.eb[0] + Ly.eb[1], W.h16 + (size_t) p0 * F, C, F,
+                                        W.y32 + (size_t) p0 * C, g_s);
+                    continue;
+                }
                 if (g_group && g_group_exp && T > 1) {
                     const int g0 = part ? ng[0] : 0, gc = ng[part];
                     k::experts_gate_up_swiglu_g(pgb + g0, pgn + g0, pgt + (size_t) g0 * k::kGroupMax,
@@ -3580,7 +3616,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
             if (n_jobs > 0) {
                 g_pool->wait();
-                g_t_cpu = 0.9 * g_t_cpu + 0.1 * (now() - tc0) / n_jobs;
+                g_cpu_busy += now() - tc0, ++g_cpu_batches;
+                t_cpu = 0.9 * t_cpu + 0.1 * (now() - tc0) / n_jobs;
                 CU(cudaMemcpyAsync(W.y32 + (size_t) (nh + nw) * C, yh, (size_t) n_jobs * C * 4, cudaMemcpyHostToDevice,
                                    g_s));
             }
@@ -3699,6 +3736,7 @@ int big_begin(const Model& M, Work& W, ExpertCache& EC, int n, int ctx_end, BigS
     const size_t bytes = T > W.T_sup ? big_carve(c, T, W.gu32_bytes, lg_want, W.lg_cap, nullptr, nullptr) : lg_bytes;
     const int k = (int) ((bytes + P.slot_bytes - 1) / P.slot_bytes);
     CU(cudaStreamSynchronize(g_cs));
+    if (g_ls) CU(cudaStreamSynchronize(g_ls));
     CU(cudaStreamSynchronize(g_s));
     g_seq_done = g_seq_next - 1;
     uint8_t* base = EC.lend(p, k);
@@ -4293,8 +4331,17 @@ int main(int argc, char** argv) {
     //  over PCIe, and the lane measured 16.4 against 16.8 tok/s - IK2_CPU=1 to try it)
     if (getenv("IK2_CPU") && std::atoi(getenv("IK2_CPU")) && ik2::cpu::available() && threads > 1 && n_gpu == 1)
         g_pool = new ik2::cpu::Pool(threads - 1);
+    if (getenv("IK2_CPU_Q8")) g_cpu_q8 = std::atoi(getenv("IK2_CPU_Q8")) != 0;
     if (getenv("IK2_UP_MS")) g_t_up = std::atof(getenv("IK2_UP_MS")) * 1e-3;
     g_cpu_lazy = !getenv("IK2_CPU_LAZY") || std::atoi(getenv("IK2_CPU_LAZY"));
+    g_lazy_cpu = getenv("IK2_LAZY_CPU") && std::atoi(getenv("IK2_LAZY_CPU"));
+    g_lazy_max = getenv("IK2_LAZY_MAX") ? std::atoi(getenv("IK2_LAZY_MAX")) : 0;
+    g_lazy_per = getenv("IK2_LAZY_PER") ? std::atoi(getenv("IK2_LAZY_PER")) : 0;
+    if (getenv("IK2_LAZY_STREAM") && std::atoi(getenv("IK2_LAZY_STREAM")) && n_gpu == 1) {
+        int lo = 0, hi = 0;
+        CU(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+        CU(cudaStreamCreateWithPriority(&g_ls, cudaStreamNonBlocking, lo));
+    }
     if (n_gpu > 1 && getenv("IK2_DENSE")) die("IK2_DENSE with --gpus > 1");
 
     // Do the experts all fit in VRAM beside the dense weights and the K / V cache (Inkling-2-Mini's 14.7 GiB on a 24 GB
@@ -4964,7 +5011,10 @@ int main(int argc, char** argv) {
     CU(cudaMemGetInfo(&fr, &tot));
     // (what is left free: 2 GiB beside a cache that streams experts in and out; a quarter of one when every expert
     //  stays in VRAM - nothing more is allocated but a token's graph)
-    const size_t room = g_fast_want ? (size_t) 256 << 20 : (size_t) 2 << 30;
+    // (IK2_ROOM_MIB overrides the streaming reserve: an 8 GB card has no 2 GiB to spare beside the cache)
+    const size_t room = getenv("IK2_ROOM_MIB") ? (size_t) std::max(0, atoi(getenv("IK2_ROOM_MIB"))) << 20
+                        : g_fast_want         ? (size_t) 256 << 20
+                                              : (size_t) 2 << 30;
     const size_t budget = std::min((size_t) (cache_gb * 1073741824.0), fr > room ? fr - room : (size_t) 0);
     EC.tp = g_tp ? d : -1;
     EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget);
@@ -5903,6 +5953,9 @@ int main(int argc, char** argv) {
     if (g_pool)
         std::printf("CPU lane: %d threads, %llu experts computed on the CPU (%.2f ms each at the end), %llu waited for\n",
                     g_pool->size(), (unsigned long long) g_n_cpu, g_t_cpu * 1e3, (unsigned long long) g_n_wait);
+    if (g_pool && g_cpu_batches)
+        std::printf("CPU lane batches: %ld, %.1f us each, Q8_0 %.2f ms a job\n", g_cpu_batches,
+                    g_cpu_busy / g_cpu_batches * 1e6, g_t_cpu_f[1] * 1e3);
     if (g_prof)
         std::printf("profile (all calls): attention %.2f s, router %.2f s, uploads %.2f s, experts %.2f s, rest %.2f s\n",
                     g_pf.attn, g_pf.route, g_pf.upload, g_pf.experts, g_pf.rest);
