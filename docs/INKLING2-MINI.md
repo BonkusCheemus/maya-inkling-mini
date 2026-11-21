@@ -34,11 +34,12 @@ This build runs the encoder on the CPU. For the GPU add `-DSTRATA_VISION_CUDA=ON
 
 ```bash
 hf download unsloth/Inkling-2-Mini-GGUF Inkling-2-Mini-UD-Q4_K_XL.gguf mmproj-BF16.gguf --local-dir models
+hf download thinkingmachines/Inkling-2-Mini mtp.safetensors --local-dir models
 python tools/strata_tokenizer.py --gguf models/Inkling-2-Mini-UD-Q4_K_XL.gguf --out ik2 \
   --chat-template tools/ik2/chat_template.jinja --check
 ```
 
-The second command writes the tokenizer files the server reads to `ik2/tokenizer`. Only `UD-Q4_K_XL` works: `UD-Q8_K_XL` keeps the experts of the last 4 layers in BF16, which the engine doesn't load. Both files carry the same NVFP4 experts for layers 0 to 19, so `UD-Q8_K_XL` wouldn't be faster or much more exact anyway.
+The second command fetches the drafter, `mtp.safetensors` (0.6 GB) from Thinking Machines' own repository; skip it if you run the configs without the drafter. The third writes the tokenizer files the server reads to `ik2/tokenizer`. Only `UD-Q4_K_XL` works: `UD-Q8_K_XL` keeps the experts of the last 4 layers in BF16, which the engine doesn't load. Both files carry the same NVFP4 experts for layers 0 to 19, so `UD-Q8_K_XL` wouldn't be faster or much more exact anyway.
 
 ### 4. Run
 
@@ -60,15 +61,16 @@ To pick the card, set `CUDA_VISIBLE_DEVICES` before the command.
 
 ## Configs
 
-All 3 are in [`docs/inkling2-mini/`](inkling2-mini/).
+All 4 are in [`docs/inkling2-mini/`](inkling2-mini/).
 
-| Config | Context | Image encoder | VRAM |
-|---|---:|---|---:|
-| `ik2-mini.json` | 344,064 | CPU | 23.3 GiB at start, 23.6 at 340K tokens |
-| `ik2-mini-text.json` | 344,064 | none | the same |
-| `ik2-mini-gpu-vision.json` | 262,144 | GPU, 1.3 GiB | 23.7 GiB |
+| Config | Context | Drafter | Image encoder | VRAM |
+|---|---:|---|---|---:|
+| `ik2-mini.json` | 262,144 | yes | CPU | 23.8 GiB |
+| `ik2-mini-long.json` | 344,064 | no | CPU | 23.3 GiB at start, 23.6 at 340K tokens |
+| `ik2-mini-text.json` | 344,064 | no | none | the same |
+| `ik2-mini-gpu-vision.json` | 262,144 | no | GPU, 1.3 GiB | 23.7 GiB |
 
-The context is the prompt, the image tokens and the answer together. A smaller `--max-context` frees VRAM: the FP8 KV cache of the 8 layer visits without a window takes 16 KB per token, 5.5 GiB at 344,064.
+The context is the prompt, the image tokens and the answer together. A smaller `--max-context` frees VRAM: the FP8 KV cache of the 8 layer visits without a window takes 16 KB per token, 5.5 GiB at 344,064. The drafter holds 0.7 GiB of weights plus 4 KB per position of the context its global layer sees (`IK2_DRAFT_CTX`, 65,536 in the config).
 
 The `env` block in the configs:
 
@@ -78,6 +80,9 @@ The `env` block in the configs:
 | `IK2_GATE_BF16=1`, `IK2_GATE_TILE=64` | The loop's gate weights kept as the 16 bits they really are, a fixed block shape for their kernel |
 | `IK2_Q8_UNROLL=1` | Dense Q8 kernels compiled for this model's widths |
 | `IK2_BATCH_PREFILL=1` | Experts of a prompt chunk handled in batches: about 6% faster prefill |
+| `IK2_DRAFT_CTX=65536` | The drafter's global layer sees the last 65,536 positions (default: the whole context, which needs 1 GiB more at 262K) |
+
+With `--draft` the engine decides every step whether to draft. A window of B tokens is worth (1 - a^B) / (1 - a) tokens, where a is how often recent drafts were accepted; it drafts when that, over the window's measured time, beats a plain token's time, and after 8 plain tokens it drafts once to look again. `IK2_DRAFT_WIDTH` (default 5) sets the widest window, `IK2_DRAFT_ADAPT=0` always drafts at that width.
 
 The tensor core expert kernels are on by default; `IK2_EXPERT_MMA=0` in `env` switches back to the scalar ones, which give the same logits bit for bit as the older builds. Every setting is listed in [SETTINGS.md](SETTINGS.md).
 
@@ -102,7 +107,25 @@ IK2_KV=fp8 IK2_GATE_TILE=64 IK2_GATE_BF16=1 IK2_Q8_UNROLL=1 IK2_BATCH_PREFILL=1 
 
 `IDS.txt` is a comma separated list of token ids. Run the CLI with `--ctx`: without it the engine doesn't keep every expert in VRAM and takes its slower general path.
 
-Through the HTTP server, one client: a new story 129.5 tok/s, new Python code at temperature 0.7 127.2 tok/s. A chat turn of 12 new tokens is read in 56 ms.
+Through the HTTP server, one client, no drafter: a new story 129.5 tok/s, new Python code at temperature 0.7 127.2 tok/s. A chat turn of 12 new tokens is read in 56 ms.
+
+With the drafter (context 262,144, `IK2_DRAFT_CTX=65536`, the same card), against plain decode on the same build:
+
+| Text | Prompt, tokens | Plain, tok/s | Drafter, tok/s | Tokens per window | Plain tokens left |
+|---|---:|---:|---:|---:|---:|
+| Prose | 42 | 126.0 | 131.1 | 2.63 | 241 of 383 |
+| New code | 51 | 125.5 | 148.7 | 2.93 | 99 |
+| Editing a document | 512 | 123.7 | 211.6 | 4.36 | 17 |
+| Copying code | 512 | 124.0 | 188.1 | 3.71 | 1 |
+| A real document | 63,981 | 103.6 | 124.8 | 3.27 | 49 |
+
+```bash
+IK2_KV=fp8 IK2_GATE_TILE=64 IK2_GATE_BF16=1 IK2_Q8_UNROLL=1 IK2_BATCH_PREFILL=1 IK2_DRAFT_CTX=65536 \
+  build/maya-ik2 --model models/Inkling-2-Mini-UD-Q4_K_XL.gguf --ctx 262144 --chunk 2048 --tokens @IDS.txt --gen 384 \
+  --draft models/mtp.safetensors
+```
+
+Through the server new code runs at 182 to 207 tok/s greedy and about 205 at temperature 0.7. A coding agent (DeepSeek Harness) writing a 3-file landing page wrote its files at 150 to 167 tok/s.
 
 llama.cpp `b12590` with the Inkling 2 pull requests, same card and file: 57.0 tok/s decode and 1,052 tok/s prefill of 4,096 tokens; 65,536 tokens deep 42.7 and 630.
 
@@ -122,11 +145,15 @@ Inkling 2 Mini is a 26B MoE: 24 layers of weights, 128 experts each (8 per token
 
 **Fewer launches.** Every kernel launch costs 2 µs or more whatever it does. Convs ride the products before them, a looped layer's q, k and v products are one launch, the loop's messages for all 12 core layers are one launch per pass: 1,404 launches per token became 781.
 
+**The drafter's window.** Thinking Machines' drafter (3 layers, fed by the model's stream at visits 5, 23 and 41 and its final hidden) guesses the next tokens, and the model checks the anchor and the guesses in one pass. That pass has its own path: positions read from the device, the window's expert picks grouped on the GPU so an expert is read once for all the tokens that picked it (5 tokens read 2.7 times one token's experts, not 5), the attention reading each key once for the window's queries, the short convs' histories recorded and rolled back in one launch for the rejected tokens, one CUDA graph per window size. 5 tokens cost 15.6 ms against 7.8 ms for one, and 40.8 ms through the general prompt path. Sampled output stays exact: a guess is accepted with the model's probability of it, otherwise the model's distribution without it is sampled.
+
 **Prefill** decodes the experts a chunk needs to FP16 and runs cuBLAS GEMMs, with a flash attention kernel that reads the FP8 cache. Short prompts up to 96 tokens take a path that reads each expert once for up to 8 of its tokens.
 
 What I tried that didn't help:
 
-* **The DSpark drafter.** It gets 2.0 to 4.2 tokens accepted per step (prose 2.0, code 3.1) and a window of 8 tokens pays for itself from about 3.3. On new code it reached 139 tok/s, on prose it fell to 87.
+* **The drafter through the general prompt path.** A window of 5 cost 41 ms there (the expert groups built on the host, a sync per layer): code 66 tok/s. It needed the window path above.
+* **A drafter context cut to the last 16K positions.** Faster drafting on long contexts, but on a 64K document 2.24 tokens per window against 3.07 with the whole context.
+* **A vocabulary shortlist in the drafter's Markov head.** The same time, fewer tokens accepted.
 * **Skipping V reads for small attention weights.** The model's global attention is spread out: 0.0% of the steps could be skipped on a real 64K text.
 * **Asking for more bytes ahead in the dense Q8 kernels.** They already run at 715 GB/s, the memory's limit.
 * **Approximating the expert input with 2 int8 parts and DP4A.** 125 tok/s, but 71 of 96 on GSM8K against 73.
@@ -135,13 +162,14 @@ What I tried that didn't help:
 
 * 96 GSM8K questions, greedy, reasoning off: 73 solved with the scalar expert kernels, 74 with the tensor core ones (3 lost, 4 gained).
 * 399 forced tokens of real text with an FP16 cache, tensor core experts against scalar: median KL 5.7e-5, the same top token on 394. The model is sensitive on this text: the tensor core attention against its scalar kernel gives 1.7e-4 and 393.
+* The drafter's window against the general prompt path on the same tokens, FP16 cache: KL about 5e-8 per row (up to 5e-4 at near router ties). 96 GSM8K questions, greedy: 77 solved with the drafter, 74 without.
 * An FP8 cache against FP16: median KL 1.1e-3. Any 2 FP8 runs drift apart within a few tokens, because a difference of 1e-5 flips codes of a 3-bit mantissa. That is the cache format, not a bug.
 * The float64 reference `ref/inkling2.py` agrees with llama.cpp on 47 of 47 top tokens, and the engine with the reference on 45 to 46 of 47.
 
 ## What else is in the tree
 
-The branch also carries experimental code that the configs above leave off: a 1,048,576 token context with experts swapped between RAM and VRAM (about 9 tok/s at that depth), a CPU lane for expert products on AVX2 hosts, verified copying of text from the prompt for edits (`IK2_SUFFIX`), and the DSpark drafter. They are described in [INKLING2.md](INKLING2.md), section 8.
+The branch also carries experimental code that the configs above leave off: a 1,048,576 token context with experts swapped between RAM and VRAM (about 9 tok/s at that depth), a CPU lane for expert products on AVX2 hosts and verified copying of text from the prompt for edits (`IK2_SUFFIX`, which the drafter replaces). They are described in [INKLING2.md](INKLING2.md), section 8.
 
 ## Credits
 
-[Project Maya](https://github.com/mw00/project-maya) by Peasant Smith and the Maya contributors is the base, and `maya-ik2` began as the Inkling 2 Small engine of Maya's pull requests #981 and #1079. [Strata](https://github.com/Niko1221/Strata) by Niko1221 is where Maya came from. The model is by [Thinking Machines](https://huggingface.co/thinkingmachines/Inkling-2-Mini), the GGUF by [Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), ggml and `mtmd` by the llama.cpp authors.
+[Project Maya](https://github.com/mw00/project-maya) by Peasant Smith and the Maya contributors is the base, and `maya-ik2` began as the Inkling 2 Small engine of Maya's pull requests #981 and #1079. [Strata](https://github.com/Niko1221/Strata) by Niko1221 is where Maya came from. The model is by [Thinking Machines](https://huggingface.co/thinkingmachines/Inkling-2-Mini), the GGUF by [Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), ggml and `mtmd` by the llama.cpp authors. The Windows / CUDA 13 build and two-GPU expert parallel are by [@cobra91](https://github.com/cobra91).
