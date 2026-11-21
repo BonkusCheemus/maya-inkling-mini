@@ -5935,6 +5935,10 @@ int main(int argc, char** argv) {
                 if (waiting.empty()) {
                     stop_all.store(false);
                     g_cancel = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(m_in);
+                        if (q_in.empty()) stop_rids.clear();
+                    }
                     if (quit_req) {
                         pop_dump();
                         break;
