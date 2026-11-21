@@ -1804,6 +1804,12 @@ __global__ void to_f16_kernel(const float* x, size_t n, uint16_t* y) {
     if (i < n) y[i] = f2h(x[i]);
 }
 
+__global__ void to_f16_limbs_kernel(const float* x, size_t n, uint16_t* y) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint16_t hi = f2h(x[i]);
+    y[i] = hi, y[n + i] = f2h(x[i] - h2f(hi));
+}
 __global__ void softcap_kernel(float* x, size_t n, float cap) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = cap * tanhf(x[i] / cap);
@@ -2758,6 +2764,90 @@ __global__ void grouped_expert_mma(const uint8_t* const* blobs, const int* tok, 
             out[(size_t)dst * C + r] = a0;
             out[(size_t)dst * C + r + 8] = a1;
         }
+    }
+}
+
+// ---- one token's NVFP4 experts through the tensor cores, straight from their blocks into the registers.
+// A warp is 16 rows (gate / up: 8 gate rows and the same 8 of up, so that SwiGLU is a lane's; down: 16 rows) over
+// the whole K, no shared memory.  Lane (g, t): sub-block t of rows g and g + 8 of each 64-value block - four MMA a
+// block, MMA m the sub-block's bytes 2 m and 2 m + 1 (low nibbles values 2 m, 2 m + 1 in k slots 2 t, 2 t + 1; high
+// nibbles values 2 m + 8, 2 m + 9 in slots 2 t + 8, 2 t + 9).  B: the input in FP16 where it is, the same in all
+// eight columns.  A code times its sub-block's scale is exact in FP16 (a code is at most 12, ue4m3 at most 240 and
+// at least 2^-10); the sum is the tensor cores' FP32.
+__device__ __forceinline__ uint32_t ue4m3_h2(uint32_t x) {   // FP16 bits of ue4m3(x) in both halves
+    const uint32_t e = (x >> 3) & 15u, m = x & 7u;
+    const uint32_t sub = __byte_perm(0x1a181400u, 0x1f1e1d1cu, m) << 8;   // m 2^-10
+    uint32_t h = e ? (((e + 7u) << 10) | (m << 7)) : sub;
+    h = (x == 0x7Fu) ? 0u : h;
+    return h | (h << 16);
+}
+__device__ __forceinline__ uint32_t nv_pair_h2(uint32_t s, uint32_t scale) {   // bytes 0 and 1's low nibbles
+    const uint32_t mag = __byte_perm(0x42403c00u, 0x4a484644u, (s & 0x0707u) << 4);
+    const uint32_t sign = ((s & 0x0808u) * 0x101000u) & 0x80008000u;
+    uint32_t r;
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(mag | sign), "r"(scale));
+    return r;
+}
+struct NvStep {   // a lane's part of a 64-value block of its two rows: the sub-block's scales and codes
+    uint32_t sa, sb, wa0, wa1, wb0, wb1;
+};
+__device__ __forceinline__ NvStep nv_step_load(const uint8_t* a, const uint8_t* b, int k, int t) {
+    const uint32_t* ap = (const uint32_t*) (a + (size_t) k * 36);
+    const uint32_t* bp = (const uint32_t*) (b + (size_t) k * 36);
+    NvStep r;
+    r.sa = __ldg(ap), r.sb = __ldg(bp);
+    r.wa0 = __ldg(ap + 1 + 2 * t), r.wa1 = __ldg(ap + 2 + 2 * t);
+    r.wb0 = __ldg(bp + 1 + 2 * t), r.wb1 = __ldg(bp + 2 + 2 * t);
+    return r;
+}
+// A block is a group of 16 rows, its SPLIT warps each a stride of the K blocks (more rows of weights in flight than
+// a warp alone keeps: a warp waits for a block's bytes before it asks for more than the next one's).
+template <bool Gate, int SPLIT>
+__global__ void __launch_bounds__(SPLIT * 32)
+experts_mma_kernel(const uint8_t* const* __restrict__ blob, size_t off, int C, int F, const uint16_t* __restrict__ x16,
+                   int x_ld, uint16_t* hidden, float* y, const float* sg, const float* su, float gcap, float ucap) {
+    __shared__ float2 part[SPLIT][8];
+    const int lane = threadIdx.x & 31, split = threadIdx.x >> 5, g = lane >> 2, t = lane & 3, slot = blockIdx.y;
+    const int K = Gate ? C : F;
+    const int r = blockIdx.x * (Gate ? 8 : 16) + g;
+    const size_t rb = (size_t) (K / 64) * 36;
+    const uint8_t* a = blob[slot] + (Gate ? 0 : off) + (size_t) r * rb;
+    const uint8_t* b = Gate ? a + off : a + 8 * rb;
+    // (gate / up: the input as two FP16 limbs, x = hi + lo, [2][C] - column 0 takes hi, column 1 lo, and a row's
+    //  two columns add up to the product with the FP32 input; down: h is FP16 itself, every column the same)
+    const uint4* xp = (const uint4*) (x16 + (Gate ? (g == 1 ? (size_t) C : 0) : (size_t) slot * x_ld)) + 2 * t;
+    float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const int nk = K / 64;
+    NvStep cur = nv_step_load(a, b, split, t);
+    for (int k = split; k < nk; k += SPLIT) {
+        NvStep nxt = cur;
+        if (k + SPLIT < nk) nxt = nv_step_load(a, b, k + SPLIT, t);
+        const uint32_t sa = ue4m3_h2((cur.sa >> (8 * t)) & 0xFFu), sb = ue4m3_h2((cur.sb >> (8 * t)) & 0xFFu);
+        const uint32_t wa[2] = {cur.wa0, cur.wa1}, wb[2] = {cur.wb0, cur.wb1};
+        const uint4 x0 = __ldg(xp + k * 8), x1 = __ldg(xp + k * 8 + 1);
+        const uint32_t xx[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            const uint32_t qa = wa[m >> 1] >> (16 * (m & 1)), qb = wb[m >> 1] >> (16 * (m & 1));
+            const uint32_t af[4] = {nv_pair_h2(qa, sa), nv_pair_h2(qb, sb), nv_pair_h2(qa >> 4, sa),
+                                    nv_pair_h2(qb >> 4, sb)};
+            mma16816(v, af, xx[m], xx[4 + m]);
+        }
+        cur = nxt;
+    }
+    if (t == 0) part[split][g] = Gate ? make_float2(v[0] + v[1], v[2] + v[3]) : make_float2(v[0], v[2]);
+    __syncthreads();
+    if (split || t) return;
+    float2 tot = part[0][g];
+#pragma unroll
+    for (int i = 1; i < SPLIT; ++i) tot.x += part[i][g].x, tot.y += part[i][g].y;
+    if (Gate) {
+        const float gg = tot.x * (sg ? sg[slot] : 1.0f), u = tot.y * (su ? su[slot] : 1.0f);
+        hidden[(size_t) slot * F + r] =
+            f2h(gcap * tanhf(gg / gcap) * (1.0f / (1.0f + expf(-gg))) * ucap * tanhf(u / ucap));
+    } else {
+        y[(size_t) slot * C + r] = tot.x;
+        y[(size_t) slot * C + r + 8] = tot.y;
     }
 }
 
@@ -3746,9 +3836,16 @@ __global__ void route_token_kernel(const float* __restrict__ logits, const float
                                    float scale, const uint8_t* const* __restrict__ tab, const float* __restrict__ sg_t,
                                    const float* __restrict__ su_t, const float* __restrict__ sd_t, int* top, float* w,
                                    const uint8_t** blob, int* tok, int* inv, float* sg, float* su, float* wt,
-                                   const float* x, int width, NvInput* packed, bool q8) {
+                                   const float* x, int width, NvInput* packed, bool q8, uint16_t* x_limbs) {
     if (blockIdx.x) {
-        pack_limbs<true>(x, nullptr, width, packed, (blockIdx.x - 1) * blockDim.x + threadIdx.x, 0, q8);
+        const int i = (blockIdx.x - 1) * blockDim.x + threadIdx.x;
+        if (x_limbs) {   // x = hi + lo in FP16, [2][width] (experts_gate_up_swiglu_mma's input)
+            if (i < width) {
+                const uint16_t hi = f2h(x[i]);
+                x_limbs[i] = hi, x_limbs[width + i] = f2h(x[i] - h2f(hi));
+            }
+        } else
+            pack_limbs<true>(x, nullptr, width, packed, i, 0, q8);
         return;
     }
     extern __shared__ float rt_sm[];
@@ -4560,6 +4657,11 @@ void to_f16(const float* x, size_t n, uint16_t* y, cudaStream_t s) {
     check("to_f16");
 }
 
+void to_f16_limbs(const float* x, size_t n, uint16_t* y, cudaStream_t s) {
+    if (!n) return;
+    to_f16_limbs_kernel<<<grid(n), kBlk, 0, s>>>(x, n, y);
+    check("to_f16_limbs");
+}
 void softcap(float* x, size_t n, float cap, cudaStream_t s) {
     if (!n) return;
     softcap_kernel<<<grid(n), kBlk, 0, s>>>(x, n, cap);
@@ -4768,6 +4870,42 @@ void expert_limb_mv(bool gate, const uint8_t* const* blob, size_t offset, int C,
                 <<<dim3((C + 7) / 8, S), 128, 0, stream>>>(blob, p, offset, C, F, nullptr, nullptr, 0, 0, nullptr, y);
     }
     check("nv_expert_limb");
+}
+bool experts_mma_fits(int ty_gate, int ty_up, int ty_down, int C, int F) {
+    return ty_gate == kNVFP4 && ty_up == kNVFP4 && ty_down == kNVFP4 && C % 64 == 0 && F % 64 == 0;
+}
+static int experts_mma_split(bool gate) {
+    static const int wg = getenv("IK2_EXPERT_MMA_SPLIT") ? atoi(getenv("IK2_EXPERT_MMA_SPLIT")) : 8;
+    static const int wd = getenv("IK2_EXPERT_MMA_SPLIT_DOWN") ? atoi(getenv("IK2_EXPERT_MMA_SPLIT_DOWN")) : 4;
+    return gate ? wg : wd;
+}
+template <bool Gate>
+static void launch_experts_mma(const uint8_t* const* blob, int S, size_t off, const uint16_t* x16, int x_ld, int C,
+                               int F, const float* sg, const float* su, float gcap, float ucap, uint16_t* h, float* y,
+                               cudaStream_t s) {
+    const int w = experts_mma_split(Gate);
+    const dim3 g((unsigned) (Gate ? F / 8 : C / 16), (unsigned) S);
+#define IK2_MMA_LAUNCH(W) experts_mma_kernel<Gate, W><<<g, W * 32, 0, s>>>(blob, off, C, F, x16, x_ld, h, y, sg, su, gcap, ucap)
+    if (w == 1) IK2_MMA_LAUNCH(1);
+    else if (w == 2) IK2_MMA_LAUNCH(2);
+    else if (w == 3) IK2_MMA_LAUNCH(3);
+    else if (w == 6) IK2_MMA_LAUNCH(6);
+    else if (w == 8) IK2_MMA_LAUNCH(8);
+    else IK2_MMA_LAUNCH(4);
+#undef IK2_MMA_LAUNCH
+}
+void experts_gate_up_swiglu_mma(const uint8_t* const* blob, int S, size_t eb0, const uint16_t* x16, int C, int F,
+                                const float* sg, const float* su, float gcap, float ucap, uint16_t* h,
+                                cudaStream_t s) {
+    if (S <= 0) return;
+    launch_experts_mma<true>(blob, S, eb0, x16, 0, C, F, sg, su, gcap, ucap, h, nullptr, s);
+    check("experts_gate_up_swiglu_mma");
+}
+void experts_down_mma(const uint8_t* const* blob, int S, size_t off_down, const uint16_t* h, int C, int F, float* y,
+                      cudaStream_t s) {
+    if (S <= 0) return;
+    launch_experts_mma<false>(blob, S, off_down, h, F, C, F, nullptr, nullptr, 0.0f, 0.0f, nullptr, y, s);
+    check("experts_down_mma");
 }
 void experts_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
                      const float* x, int C, int F, float* gu, cudaStream_t s) {
@@ -5053,18 +5191,19 @@ void route_gather(const int* top, const float* w, const uint8_t* const* tab, con
 void route_token(const float* logits, const float* bias, int E, int K, float scale, const uint8_t* const* tab,
                  const float* sg_t, const float* su_t, const float* sd_t, int* top, float* w, const uint8_t** blob,
                  int* tok, int* inv, float* sg, float* su, float* wt, cudaStream_t s, const float* x, int width,
-                 void* packed, bool q8) {
+                 void* packed, bool q8, uint16_t* x_limbs) {
     if (E > 1024 || K > E) {   // (more experts than a block's threads: the two kernels)
         if (packed) nv_input<true><<<(width / 16 + 31) / 32, 32, 0, s>>>(x, nullptr, width, (NvInput*)packed, q8);
+        if (x_limbs) to_f16_limbs(x, (size_t) width, x_limbs, s);
         route(logits, bias, 1, E, K, scale, top, w, s);
         route_gather(top, w, tab, sg_t, su_t, sd_t, K, K, blob, tok, inv, sg, su, wt, s);
         return;
     }
     const unsigned nt = (unsigned) ((E + 31) / 32 * 32);
-    const unsigned blocks = 1 + (packed ? (width / 16 + nt - 1) / nt : 0);
+    const unsigned blocks = 1 + (x_limbs ? (width + nt - 1) / nt : packed ? (width / 16 + nt - 1) / nt : 0);
     route_token_kernel<<<blocks, nt, (size_t)(E + nt / 32 + K + 1) * sizeof(float), s>>>(
         logits, bias, E, K, scale, tab, sg_t, su_t, sd_t, top, w, blob, tok, inv, sg, su, wt, x, width,
-        (NvInput*)packed, q8);
+        (NvInput*)packed, q8, x_limbs);
     check("route_token");
 }
 

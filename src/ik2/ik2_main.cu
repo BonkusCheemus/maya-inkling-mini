@@ -2367,9 +2367,11 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             C % 64 == 0 && (((limb & 1) && Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4) || ((limb & 4) && q8_gate));
         const bool fast_down =
             c.F % 64 == 0 && (((limb & 2) && Ly.ty[2] == k::kNVFP4) || ((limb & 8) && Ly.ty[2] == k::kQ8_0));
+        static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
+        const bool exp_tc = exp_mma && !fast_gate && !fast_down && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
         k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
                        Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
-                       fast_gate ? W.gu32 : nullptr, q8_gate);
+                       fast_gate ? W.gu32 : nullptr, q8_gate, exp_tc ? (uint16_t*) W.gu32 : nullptr);
 
 #ifdef IK2_HOST_AVX2
         if ((tier_active || host_plan.forced) && !host_plan.active.empty() && host_plan.active[l]) {
@@ -2392,6 +2394,11 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             if (stage_cold && tier_active && exbytes % 16 == 0 && exbytes * c.K <= W.lg_cap * sizeof(float))
                 stage_selected_experts<<<dim3(128, c.K), 256, 0, g_s>>>(Ly.tab_blob, Ly.tier_cold, rtop, W.blob,
                                                                         exbytes / 16, (uint4*)W.lg);
+            if (exp_tc) {
+                k::experts_gate_up_swiglu_mma(W.blob, c.K, Ly.eb[0], (const uint16_t*) W.gu32, C, c.F, W.sg, W.su,
+                                              c.gate_cap, c.up_cap, W.h16, g_s);
+                k::experts_down_mma(W.blob, c.K, Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+            } else {
             if (fast_gate)
                 k::expert_limb_mv(true, W.blob, Ly.eb[0], C, c.F, c.K, W.xq, W.h16, W.y32, W.sg, W.su, c.gate_cap,
                                   c.up_cap, W.gu32, g_s, q8_gate, true);
@@ -2403,6 +2410,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                                   c.gate_cap, c.up_cap, W.gu32, g_s, Ly.ty[2] == k::kQ8_0, false);
             else
                 k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+            }
         }
         k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
     }
