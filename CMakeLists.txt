@@ -935,6 +935,26 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       set_property(TARGET ${_ik2_targets} PROPERTY CUDA_ARCHITECTURES ${_ik2_archs})
     endif()
   endif()
+  # P0-3 spike: compile the Ikling engine's kernels as HIP to enumerate the port surface.
+  # Temporary; the real port (P3) will replace this with per-site fixes.
+  option(STRATA_HIP_IK2_SPIKE "Compile maya-ik2 sources as HIP to enumerate port work" OFF)
+  if(STRATA_HIP_IK2_SPIKE AND STRATA_ENABLE_HIP)
+    add_library(ik2_kernels STATIC src/ik2/ik2_kernels.cu)
+    target_include_directories(ik2_kernels PUBLIC ${_strata_gpu_include_directories} src/ik2)
+    target_link_libraries(ik2_kernels PUBLIC ${_strata_gpu_runtime_target})
+    add_executable(maya-ik2 src/ik2/ik2_main.cu src/ik2/ik2_draft.cu src/ik2/ik2_cpu.cpp)
+    target_include_directories(maya-ik2 PRIVATE include)
+    target_link_libraries(maya-ik2 PRIVATE ik2_kernels ${_strata_gpu_blas_target} Threads::Threads)
+    set(_ik2_targets ik2_kernels maya-ik2)
+    add_executable(ik2_kernels_test tests/ik2_kernels_test.cu)
+    target_link_libraries(ik2_kernels_test PRIVATE ik2_kernels)
+    target_include_directories(ik2_kernels_test PRIVATE include)
+    # P3-4's speed gate: the grouped NVFP4 expert GEMM timed and dumped at the model's shapes, both paths
+    # (IK2_GROUP_MMA=3 with IK2_EXPERT_WMMA=0 / 1) from this one binary.
+    add_executable(ik2_expert_bench tests/ik2_expert_bench.cu)
+    target_link_libraries(ik2_expert_bench PRIVATE ik2_kernels)
+    target_include_directories(ik2_expert_bench PRIVATE include)
+  endif()
   if((STRATA_ENABLE_CUDA AND (_mm3_archs OR NOT _mm3_filter)) OR STRATA_ENABLE_HIP)
     # (a GGUF's weights - tools/mm3/pack_gguf.py, MiniMax's Maya quants: maya-ds4's ggml block-type kernels, src/ds4/ds4_iq,
     #  on the device and its CPU rows on the CPU lane - mm3_gguf.cu, mm3_cpu_gg.cpp)

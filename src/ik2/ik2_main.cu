@@ -46,7 +46,7 @@
 #endif
 
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
-static inline cudaError_t cudaMemPrefetchAsync_compat(const void* devPtr, size_t count, int dstDevice, cudaStream_t stream = 0) {
+static inline cudaError_t memPrefetchAsyncCompat(const void* devPtr, size_t count, int dstDevice, cudaStream_t stream = 0) {
     cudaMemLocation loc{};
     if (dstDevice < 0) {
         loc.type = cudaMemLocationTypeHost;
@@ -57,9 +57,9 @@ static inline cudaError_t cudaMemPrefetchAsync_compat(const void* devPtr, size_t
     }
     return cudaMemPrefetchAsync(devPtr, count, loc, 0, stream);
 }
-#define cudaMemPrefetchAsync cudaMemPrefetchAsync_compat
+#define cudaMemPrefetchAsync memPrefetchAsyncCompat
 
-static inline cudaError_t cudaMemAdvise_compat(const void* devPtr, size_t count, cudaMemoryAdvise advice, int device) {
+static inline cudaError_t memAdviseCompat(const void* devPtr, size_t count, cudaMemoryAdvise advice, int device) {
     cudaMemLocation loc{};
     if (device < 0) {
         loc.type = cudaMemLocationTypeHost;
@@ -70,7 +70,7 @@ static inline cudaError_t cudaMemAdvise_compat(const void* devPtr, size_t count,
     }
     return cudaMemAdvise(devPtr, count, advice, loc);
 }
-#define cudaMemAdvise cudaMemAdvise_compat
+#define cudaMemAdvise memAdviseCompat
 #endif
 
 #include <algorithm>
@@ -406,6 +406,13 @@ uint8_t* g_stage = nullptr;   // a raw tensor on its way to its FP16 decode
 size_t g_stage_bytes = 0;
 
 bool g_dense_q8 = false;
+// IK2_DENSE_MV=1: keep a layer's dense matrices as planar Q8_0 (int8 values + FP16 block scales) *as well as* the
+// FP16 copy, and take a token's product over the planar form (k::mv_q8p, a warp a row) instead of a hipBLAS f16
+// GEMM.  A Q8_0 matrix is 34 / 32 = 1.0625 bytes a value against FP16's 2, so at T = 1 - where the GEMM's macro tile
+// is 16 rows deep and 1 is live - the product both reads half the weight bytes and skips the tensor cores.  Measured
+// (tests/ik2_dense_bench.cu, the decode shapes): 27-48% less GPU time a call than the f16 GEMM.  The FP16 copy stays
+// for T > 1 (prefill and the block path run GEMMs over it), so this costs VRAM: +0.55 GiB of dense weights here.
+bool g_dense_mv = false;
 // The KV cache in FP16 (IK2_KV=fp8: E4M3, half the bytes).  Against ref/inkling2.py over 48 tokens FP16 kept every
 // top-1 token (KL mean 8.5e-4) and FP8 changed 5 (KL 8.3e-3): Inkling's router is full of near-ties, so FP8's 1.5% in
 // layer 0's attention output already moves 7 of 48 tokens' experts.  The full layers' cache is 32 KB a token in FP16.
@@ -472,6 +479,16 @@ bool upload_planar(Mat& m, const std::vector<const uint8_t*>& parts, const std::
     CU(cudaMemcpy(m.q8, q.data(), n, cudaMemcpyHostToDevice));
     CU(cudaMemcpy(m.q8d, d.data(), n / 32 * 2, cudaMemcpyHostToDevice));
     return true;
+}
+
+// (IK2_DENSE_MV) the FP16 copy of a matrix that is also kept planar: T > 1's products are GEMMs over it, a token's
+// are the planar GEMV.  Built from the blocks the matrix itself holds, so the GGUF is still read once; call it after
+// upload_planar / try_load_fused_raw, never instead of them.
+void add_f16_shadow(Mat& m) {
+    if (m.f16 || !(m.q8 || m.raw)) return;
+    m.f16 = dalloc<uint16_t>((size_t) m.N * m.K);
+    if (m.q8) k::decode_q8p_f16(m.q8, m.q8d, (size_t) m.N * m.K, m.f16, g_s);
+    else k::decode_f16(m.type, m.raw, (size_t) m.N * m.K, m.f16, g_s);
 }
 
 Mat load_mat(const Shards& S, const std::string& n, int N, int Kd) {
