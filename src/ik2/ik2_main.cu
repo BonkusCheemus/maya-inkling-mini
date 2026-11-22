@@ -5609,7 +5609,9 @@ int main(int argc, char** argv) {
 #ifndef _WIN32
         std::signal(SIGPIPE, SIG_IGN);
 #endif
+#ifdef SIGUSR1   // (Windows has no SIGUSR1: the single-request path guards it the same way)
         std::signal(SIGUSR1, on_usr1);
+#endif
 
         auto parse_ints = [](const std::string& t) {
             std::vector<int> v;
