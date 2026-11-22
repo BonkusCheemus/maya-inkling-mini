@@ -94,6 +94,8 @@ The `env` block in the configs:
 
 With `--draft` the engine decides every step whether to draft. A window of B tokens is worth (1 - a^B) / (1 - a) tokens, where a is how often recent drafts were accepted; it drafts when that, over the window's measured time, beats a plain token's time, and after 8 plain tokens it drafts once to look again. `IK2_DRAFT_WIDTH` (default 5) sets the widest window, `IK2_DRAFT_ADAPT=0` always drafts at that width.
 
+**Concurrent requests (`--parallel N`).** Passing `--parallel N` (`2` to `8`, single GPU, non-managed KV) in the config's `args` serves up to `N` requests at once (`READY ... multi=N`, `INFO ... parallel=N`). The 8 global-attention visits share one paged KV pool of `--max-context` tokens (256-token pages, reused across turns by prefix match and evicted LRU from idle slots when needed); waiting requests queue until a slot and pages are free. Each extra slot adds its own sliding-window KV ring (~240 MiB at `--chunk 2048` or ~120 MiB at `--chunk 512`, FP8) plus ~48 MiB for the multi-slot CUDA graphs. On a 24 GB card, `--parallel 4` at 262,144 tokens stays resident without a drafter; with `--draft`, use `--chunk 512` and `IK2_DRAFT_CTX=8192` (or lower `--max-context` as the startup note suggests). When only one slot is decoding, `--draft` still speculates on that slot; when 2 or more decode together, they share one batched CUDA graph per batch size.
+
 The tensor core expert kernels are on by default; `IK2_EXPERT_MMA=0` in `env` switches back to the scalar ones, which give the same logits bit for bit as the older builds. Every setting is listed in [SETTINGS.md](SETTINGS.md).
 
 ## Numbers
@@ -136,6 +138,8 @@ IK2_KV=fp8 IK2_GATE_TILE=64 IK2_GATE_BF16=1 IK2_Q8_UNROLL=1 IK2_BATCH_PREFILL=1 
 ```
 
 Through the server new code runs at 182 to 207 tok/s greedy and about 205 at temperature 0.7. A coding agent (DeepSeek Harness) writing a 3-file landing page wrote its files at 150 to 167 tok/s.
+
+With `--parallel 4` through the server (262,144 context, FP8 KV, no drafter), 4 concurrent 300-token prompts decode at ~205 tok/s aggregate against ~120 tok/s solo. On a batch of 96 GSM8K prompts end-to-end (including uncached prefills), 4 concurrent requests finish in 239.6 s (127.7 tok/s) against 393.1 s (78.2 tok/s) with `--parallel 1`.
 
 llama.cpp `b12590` with the Inkling 2 pull requests, same card and file: 57.0 tok/s decode and 1,052 tok/s prefill of 4,096 tokens; 65,536 tokens deep 42.7 and 630.
 
@@ -188,6 +192,7 @@ What I tried that didn't help:
 * 96 GSM8K questions, greedy, reasoning off: 73 solved with the scalar expert kernels, 74 with the tensor core ones (3 lost, 4 gained).
 * 399 forced tokens of real text with an FP16 cache, tensor core experts against scalar: median KL 5.7e-5, the same top token on 394. The model is sensitive on this text: the tensor core attention against its scalar kernel gives 1.7e-4 and 393.
 * The drafter's window against the general prompt path on the same tokens, FP16 cache: KL about 5e-8 per row (up to 5e-4 at near router ties). 96 GSM8K questions, greedy: 77 solved with the drafter, 74 without.
+* Batched `--parallel 4` decode against solo `forward()` on identical tokens, FP16 cache (`IK2_SLOTS_CHECK=32`, 125 token-rows across `B=2..4`): median KL ~3e-8 per row (up to 3.5e-4 at near router ties), 0 argmax disagreements. On 96 GSM8K questions, greedy, FP8 cache (no drafter): 90 solved with `--parallel 4` (4 concurrent) against 89 with `--parallel 1`.
 * An FP8 cache against FP16: median KL 1.1e-3. Any 2 FP8 runs drift apart within a few tokens, because a difference of 1e-5 flips codes of a 3-bit mantissa. That is the cache format, not a bug.
 * Tool calls: the model sometimes writes its call as `{"name":"read_file"args":{...}}`, with the comma and the quote
   before `args` left out. llama.cpp writes the same call on the same prompt (its chat endpoint hides it with a
