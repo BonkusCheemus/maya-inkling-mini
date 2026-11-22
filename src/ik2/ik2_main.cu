@@ -124,6 +124,20 @@ namespace k = ik2::k;
     std::exit(1);
 }
 
+std::string fmt_gib(size_t b) {
+    char m[32];
+    std::snprintf(m, sizeof m, "%.2f GiB", b / 1073741824.0);
+    return m;
+}
+std::string g_fit_hint;   // the start's note when the experts did not fit, for the late check
+bool g_serve_note = false;   // --serve (Maya's protocol): notes also as NOTE lines, which serve/server.py prints
+// a line for the log, and under --serve the same as a NOTE (the server relays NOTE, INFO and VRAM lines only)
+void note(const std::string& m) {
+    std::printf("%s\n", m.c_str());
+    if (g_serve_note) std::printf("NOTE maya-ik2: %s\n", m.c_str());
+    std::fflush(stdout);
+}
+
 double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 // ---- the files
@@ -4208,6 +4222,7 @@ int main(int argc, char** argv) {
         g_trace = std::fopen(getenv("IK2_TRACE"), "wb");
         if (!g_trace) die(std::string("cannot write ") + getenv("IK2_TRACE"));
     }
+    g_serve_note = serve && serve_maya;
     if (model.empty() || (toks.empty() && !serve))
         die("usage: maya-ik2 --model FIRST.gguf (--tokens 1,2,3 [--gen N] | --serve) [--chunk 2048] [--ctx N] ...");
     std::vector<int> prompt;
@@ -4405,14 +4420,58 @@ int main(int argc, char** argv) {
         size_t fr0 = 0, tot0 = 0;
         CU(cudaMemGetInfo(&fr0, &tot0));
         const size_t reserve = (size_t) 3 << 29;   // (the work buffers and a quarter of a GiB of room: 1.5 GiB)
-        const bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= (size_t) (cache_gb * 1073741824.0);
+        // the drafter (--draft, loaded before the expert cache): its weights as FP16 (the file's BF16 bytes), its
+        // global layer's FP16 K / V for IK2_DRAFT_CTX positions (default the context), its windowed layers' F32 rings
+        // and its work buffers - left out, a context that fit without it pushed experts out of VRAM with it
+        size_t draft_b = 0, draft_tok = 0;
+        if (!draft_path.empty()) {
+            if (FILE* df = std::fopen(draft_path.c_str(), "rb")) {
+                std::fseek(df, 0, SEEK_END);
+                draft_b = (size_t) std::max<long>(0, std::ftell(df));
+                std::fclose(df);
+            }
+            const int want = getenv("IK2_DRAFT_CTX") ? std::atoi(getenv("IK2_DRAFT_CTX")) : 0;
+            const size_t per = (size_t) c.KV * c.D * 2 * 2;   // (a position of the global layer: K and V in FP16)
+            if (want > 0) draft_b += (size_t) std::min(ctx, std::max(want, 2048)) * per;
+            else draft_tok = per;                             // (the whole context: grows with it)
+            draft_b += (size_t) 2 * std::min(ctx, 2048) * c.KV * c.D * 8 + ((size_t) 256 << 20);
+        }
+        size_t kv_tok = 0, kv_fixed = 0;   // (the K / V bytes a context position costs, and those that do not grow)
+        for (int l = 0; l < c.n_layer; ++l) {
+            if (g_kv_managed && !c.sliding[l]) continue;
+            const size_t visit = (size_t) (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
+            if (c.sliding[l]) kv_fixed += visit * (size_t) std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock));
+            else kv_tok += visit;
+        }
+        const bool fits = exp_b + dense_b + kv_b + draft_b + (size_t) ctx * draft_tok + reserve <= fr0 &&
+                          exp_b <= (size_t) (cache_gb * 1073741824.0);
         if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
         g_fast_want = fits && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
         stage_cold = getenv("IK2_STAGE_COLD") && atoi(getenv("IK2_STAGE_COLD"));
         g_managed_experts = g_fast_want && g_kv_managed && getenv("IK2_TIER") && atoi(getenv("IK2_TIER"));
-        std::printf("experts %.1f GiB, dense weights %.1f GiB as blocks, K / V cache %.1f GiB, %.1f GiB free: %s\n",
-                    exp_b / 1073741824.0, dense_b / 1073741824.0, kv_b / 1073741824.0, fr0 / 1073741824.0,
-                    fits ? "every expert stays in VRAM" : "the experts in host memory, a cache of them in VRAM");
+        std::printf("experts %.1f GiB, dense weights %.1f GiB as blocks, K / V cache %.1f GiB%s, %.1f GiB free: %s\n",
+                    exp_b / 1073741824.0, dense_b / 1073741824.0, kv_b / 1073741824.0,
+                    draft_path.empty() ? "" : (", the drafter " + fmt_gib(draft_b + (size_t) ctx * draft_tok)).c_str(),
+                    fr0 / 1073741824.0, fits ? "every expert stays in VRAM" : "the experts in host memory, a cache of them in VRAM");
+        if (!fits && exp_b <= (size_t) (cache_gb * 1073741824.0) && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")))) {
+            // the largest context (a multiple of 4096) that would keep every expert in VRAM, if any
+            // (half a GiB more than the estimate: what the dense weights, the work buffers and the drafter take in the
+            //  end ran up to a quarter of a GiB past it on a 3090 with another process holding 1 GB of it)
+            const size_t fixed = exp_b + dense_b + kv_fixed + draft_b + reserve + ((size_t) 1 << 29), per = kv_tok + draft_tok;
+            const long fit_ctx = fr0 > fixed && per ? (long) ((fr0 - fixed) / per) / 4096 * 4096 : 0;
+            char m[400];
+            if (fit_ctx >= 4096)
+                std::snprintf(m, sizeof m, "%.1f GiB of VRAM free, %.1f GiB needed: the experts stay in host memory and "
+                              "decode runs at about half speed. --max-context %ld or lower keeps them all in VRAM",
+                              fr0 / 1073741824.0, (exp_b + dense_b + kv_b + draft_b + (size_t) ctx * draft_tok + reserve) /
+                              1073741824.0, fit_ctx);
+            else
+                std::snprintf(m, sizeof m, "%.1f GiB of VRAM free: too little to keep every expert in VRAM at any "
+                              "context; the experts stay in host memory and decode runs at about half speed",
+                              fr0 / 1073741824.0);
+            note(m);
+            g_fit_hint = m;
+        }
     }
 
     // the dense weights
@@ -5140,7 +5199,27 @@ int main(int argc, char** argv) {
             std::printf("resident: every expert in VRAM (%d copied in %.1f s); tokens take the resident path%s\n", n,
                         now() - tw, g_graph ? ", a CUDA graph each" : "");
         } else {
-            std::printf("resident path off: %s\n", all ? "a dense matrix is not kept as blocks" : "the cache does not hold every expert");
+            if (!all) {   // (the estimate said yes, the VRAM left after the dense weights and the drafter said no)
+                size_t short_b = 0;
+                int have = 0, want = 0;
+                for (const auto& P : EC.pools) {
+                    have += P.n_active, want += P.n_layers * c.E;
+                    if (P.n_active < P.n_layers * c.E) short_b += (size_t) (P.n_layers * c.E - P.n_active) * P.slot_bytes;
+                }
+                size_t per = 0;   // (the K / V bytes of a context position)
+                for (int l = 0; l < c.n_layer; ++l)
+                    if (!c.sliding[l] && !g_kv_managed)
+                        per += (size_t) (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
+                const long less = per ? (long) ((short_b + ((size_t) 256 << 20)) / per + 4095) / 4096 * 4096 : 0;
+                char m[400];
+                std::snprintf(m, sizeof m, "resident path off: the expert cache holds %d of %d experts (%.2f GiB short)%s;"
+                              " decode runs at about half speed%s. --max-context %ld or lower keeps them all in VRAM",
+                              have, want, short_b / 1073741824.0, drafter ? " beside the drafter" : "",
+                              drafter ? " and the drafter is off" : "", std::max(4096L, (long) ctx - less));
+                note(m);
+            } else {
+                std::printf("resident path off: a dense matrix is not kept as blocks\n");
+            }
         }
     }
     std::fflush(stdout);
@@ -5268,7 +5347,7 @@ int main(int argc, char** argv) {
             eos_ids.push_back(199999);   // (Inkling 2's <|endoftext|>)
         }
         if (serve_maya) {
-            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d\n", g_kv_fp8 ? "fp8" : "f16", ctx, n_gpu);
+            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d resident=%d\n", g_kv_fp8 ? "fp8" : "f16", ctx, n_gpu, g_fast ? 1 : 0);
             std::printf("READY %d stop\n", ctx);
         } else {
             std::printf("@READY ctx %d\n", ctx);
