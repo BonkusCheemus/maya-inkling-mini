@@ -4757,10 +4757,16 @@ int main(int argc, char** argv) {
         for (int l = 0; l < c.n_layer; ++l) {
             if (g_kv_managed && !c.sliding[l]) continue;
             const size_t visit = (size_t) (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
-            if (c.sliding[l]) kv_fixed += visit * (size_t) std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock));
+            if (c.sliding[l])
+                kv_fixed += (size_t) g_parallel * visit * (size_t) std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock));
             else kv_tok += visit;
         }
-        const bool fits = exp_b + dense_b + kv_b + draft_b + (size_t) ctx * draft_tok + reserve <= fr0 &&
+        size_t par_fixed = 0;   // (--parallel > 1: extra slots' conv histories and multi-slot CUDA graphs)
+        if (g_parallel > 1) {
+            const size_t conv_slot = (size_t) c.n_visit * 3 * (2 * (size_t) c.KV * c.D + 2 * (size_t) c.C) * 4;
+            par_fixed = (size_t) (g_parallel - 1) * (conv_slot + (g_graph ? (48ULL << 20) : 0));
+        }
+        const bool fits = exp_b + dense_b + kv_b + par_fixed + draft_b + (size_t) ctx * draft_tok + reserve <= fr0 &&
                           exp_b <= (size_t) (cache_gb * 1073741824.0);
         if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
         g_fast_want = fits && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
@@ -4774,13 +4780,13 @@ int main(int argc, char** argv) {
             // the largest context (a multiple of 4096) that would keep every expert in VRAM, if any
             // (half a GiB more than the estimate: what the dense weights, the work buffers and the drafter take in the
             //  end ran up to a quarter of a GiB past it on a 3090 with another process holding 1 GB of it)
-            const size_t fixed = exp_b + dense_b + kv_fixed + draft_b + reserve + ((size_t) 1 << 29), per = kv_tok + draft_tok;
+            const size_t fixed = exp_b + dense_b + kv_fixed + par_fixed + draft_b + reserve + ((size_t) 1 << 29), per = kv_tok + draft_tok;
             const long fit_ctx = fr0 > fixed && per ? (long) ((fr0 - fixed) / per) / 4096 * 4096 : 0;
             char m[400];
             if (fit_ctx >= 4096)
                 std::snprintf(m, sizeof m, "%.1f GiB of VRAM free, %.1f GiB needed: the experts stay in host memory and "
                               "decode runs at about half speed. --max-context %ld or lower keeps them all in VRAM",
-                              fr0 / 1073741824.0, (exp_b + dense_b + kv_b + draft_b + (size_t) ctx * draft_tok + reserve) /
+                              fr0 / 1073741824.0, (exp_b + dense_b + kv_b + par_fixed + draft_b + (size_t) ctx * draft_tok + reserve) /
                               1073741824.0, fit_ctx);
             else
                 std::snprintf(m, sizeof m, "%.1f GiB of VRAM free: too little to keep every expert in VRAM at any "
@@ -5736,8 +5742,8 @@ int main(int argc, char** argv) {
             return true;
         };
 
-        std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d parallel=%d\n",
-                    g_kv_fp8 ? "fp8" : "f16", ctx, n_gpu, g_parallel);
+        std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d resident=%d parallel=%d\n",
+                    g_kv_fp8 ? "fp8" : "f16", ctx, n_gpu, g_fast ? 1 : 0, g_parallel);
         for (int s = 0; s < g_parallel; ++s) reset_slot(s);
         CU(cudaStreamSynchronize(g_s));
         std::printf("READY %d stop multi=%d\n", ctx, g_parallel);
@@ -6073,6 +6079,8 @@ int main(int argc, char** argv) {
         };
 
         const bool use_cand = !(getenv("IK2_CAND") && !std::atoi(getenv("IK2_CAND")));
+        const int slots_check = getenv("IK2_SLOTS_CHECK") ? std::atoi(getenv("IK2_SLOTS_CHECK")) : 0;
+        int slots_checked = 0;
         SpecCtl sctl;
         const bool spec_on = drafter && g_fast && g_block;
         sctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
@@ -6088,6 +6096,18 @@ int main(int argc, char** argv) {
             }
             active.erase(std::remove_if(active.begin(), active.end(), [](const std::unique_ptr<Req>& p) { return p->done; }),
                          active.end());
+
+            // Cancel any queued requests that received STOP (even behind a page-blocked head)
+            for (auto it = waiting.begin(); it != waiting.end();) {
+                if (is_stopped((*it)->rid)) {
+                    std::printf("DONE %d 0 %zu 0 0 cancel 0 0 0\n", (*it)->rid, (*it)->ids.size());
+                    std::fflush(stdout);
+                    clear_stopped((*it)->rid);
+                    it = waiting.erase(it);
+                } else {
+                    ++it;
+                }
+            }
 
             try_admit();
 
@@ -6201,6 +6221,9 @@ int main(int argc, char** argv) {
                 for (Req* rp : dec) {
                     const int P = (int) slots[rp->slot].hist.size();
                     if (!ensure_slot_pages(rp->slot, P)) {
+                        std::printf("NOTE maya-ik2: rid %d stopped early: paged KV pool full (%d pages)\n",
+                                    rp->rid, g_kv_total_pages);
+                        std::fflush(stdout);
                         finish_req(*rp, "length");
                         continue;
                     }
@@ -6273,6 +6296,69 @@ int main(int argc, char** argv) {
                         if (draft_slot == r.slot) draft_slot = -1;
                     }
                     if (g_fast) {
+                        if (slots_checked < slots_check) {
+                            // (IK2_SLOTS_CHECK=n: compare fast_slots logits against solo forward() on identical state)
+                            const size_t cc[4] = {KD, KD, C, C};
+                            std::vector<std::vector<std::vector<float>>> saved_h((size_t) B);
+                            CU(cudaStreamSynchronize(g_s));
+                            for (int b = 0; b < B; ++b) {
+                                saved_h[b].reserve(M.V.size() * 4);
+                                for (size_t l = 0; l < M.V.size(); ++l) {
+                                    Layer& Ly = bind_visit(M, (int) l, sids[b]);
+                                    float* hs[4] = {Ly.h_k, Ly.h_v, Ly.h_attn, Ly.h_mlp};
+                                    for (int i = 0; i < 4; ++i) {
+                                        saved_h[b].emplace_back(3 * cc[i]);
+                                        CU(cudaMemcpy(saved_h[b].back().data(), hs[i], 3 * cc[i] * 4,
+                                                      cudaMemcpyDeviceToHost));
+                                    }
+                                }
+                            }
+                            std::vector<float> lb;
+                            fast_slots(M, toks.data(), poss.data(), sids.data(), B, OutMode::kLogits, lb, nullptr);
+                            CU(cudaStreamSynchronize(g_s));
+                            for (int b = 0; b < B; ++b) {
+                                for (size_t l = 0; l < M.V.size(); ++l) {
+                                    Layer& Ly = bind_visit(M, (int) l, sids[b]);
+                                    float* hs[4] = {Ly.h_k, Ly.h_v, Ly.h_attn, Ly.h_mlp};
+                                    for (int i = 0; i < 4; ++i) {
+                                        CU(cudaMemcpy(hs[i], saved_h[b][l * 4 + i].data(), 3 * cc[i] * 4,
+                                                      cudaMemcpyHostToDevice));
+                                    }
+                                }
+                            }
+                            double mx = 0, kl = 0;
+                            int dis = 0;
+                            for (int b = 0; b < B; ++b) {
+                                std::vector<float> ref_row;
+                                forward(M, &toks[b], 1, poss[b], false, OutMode::kLogits, std::string(), ref_row,
+                                        nullptr, t_exp, sids[b]);
+                                const float* a = ref_row.data();
+                                const float* br = lb.data() + (size_t) b * c.n_vocab;
+                                double ma = -1e30, mb = -1e30, sa = 0, sb = 0;
+                                for (int v = 0; v < c.n_vocab; ++v)
+                                    ma = std::max(ma, (double) a[v]), mb = std::max(mb, (double) br[v]);
+                                for (int v = 0; v < c.n_vocab; ++v)
+                                    sa += std::exp(a[v] - ma), sb += std::exp(br[v] - mb);
+                                for (int v = 0; v < c.n_vocab; ++v) {
+                                    mx = std::max(mx, (double) std::fabs(a[v] - br[v]));
+                                    const double pa = std::exp(a[v] - ma) / sa;
+                                    if (pa > 0)
+                                        kl += pa * ((a[v] - ma - std::log(sa)) - (br[v] - mb - std::log(sb)));
+                                }
+                                const int aa = (int) (std::max_element(a, a + c.n_vocab) - a);
+                                const int ab = (int) (std::max_element(br, br + c.n_vocab) - br);
+                                dis += aa != ab;
+                                Req& r = *dec_ok[b];
+                                slots[r.slot].hist.push_back(r.pending_tok);
+                                r.pending_tok = pick_row(a, r);
+                                r.emitted = false;
+                            }
+                            std::fprintf(stderr,
+                                         "slots check, step %d (B=%d): max |dlogit| %.4f, KL %.2e a row, argmax differs in %d\n",
+                                         slots_checked, B, mx, kl / B, dis);
+                            std::fflush(stderr);
+                            ++slots_checked;
+                        } else {
                         const OutMode om = any_sample ? (use_cand ? OutMode::kCand : OutMode::kLogits) : OutMode::kArgmax;
                         std::vector<float> lo;
                         std::vector<int> ag;
@@ -6298,6 +6384,7 @@ int main(int argc, char** argv) {
                                 r.pending_tok = pick_row(lo.data() + (size_t) b * c.n_vocab, r);
                             }
                             r.emitted = false;
+                        }
                         }
                     } else {
                         for (int b = 0; b < B; ++b) {
