@@ -6743,11 +6743,11 @@ void attn_slots_f16(const uint16_t* q16, const float* r, int r_ld, const float* 
 void attn_flash_f16(const uint16_t*, int, const uint16_t*, const uint16_t*, int, int, int,
                     int, int, int, float, const float*, int, int,
                     const float*, float*, int, float*, size_t, int,
-                    cudaStream_t) { tc_out("attn_flash_f16"); }
+                    cudaStream_t, const int*) { tc_out("attn_flash_f16"); }
 void attn_flash_fp8(const uint16_t*, int, const uint8_t*, const uint8_t*, int, int, int,
                     int, int, int, float, float, const float*, int,
                     int, const float*, float*, int, float*, size_t,
-                    int, cudaStream_t) { tc_out("attn_flash_fp8"); }
+                    int, cudaStream_t, const int*) { tc_out("attn_flash_fp8"); }
 bool experts_mma_fits(int, int, int, int, int) { return false; }
 void experts_gate_up_swiglu_mma(const uint8_t* const*, int, size_t, const uint16_t*, int, int,
                                 const float*, const float*, float, float, uint16_t*, cudaStream_t) { tc_out("experts_gate_up_swiglu_mma"); }
@@ -6760,11 +6760,11 @@ size_t attn_decode_mma_scratch(int, int) { return 0; }
 void attn_decode_mma_f16(const uint16_t*, const float*, const float*, const uint16_t*, const uint16_t*,
                          int, int, int, const int*, int, int, float,
                          const float*, int, int, int, float*, float*,
-                         const float*, uint16_t*, cudaStream_t) { tc_out("attn_decode_mma_f16"); }
+                         const float*, uint16_t*, cudaStream_t, const int*) { tc_out("attn_decode_mma_f16"); }
 void attn_decode_mma_fp8(const uint16_t*, const float*, const float*, const uint8_t*, const uint8_t*,
                          int, int, int, const int*, int, int, float,
                          float, const float*, int, int, int, float*,
-                         float*, const float*, uint16_t*, cudaStream_t) { tc_out("attn_decode_mma_fp8"); }
+                         float*, const float*, uint16_t*, cudaStream_t, const int*) { tc_out("attn_decode_mma_fp8"); }
 void attn_block_f16(const uint16_t*, const float*, int, const float*, const uint16_t*,
                     const uint16_t*, int, int, int, const int*, int, int, float,
                     const float*, int, int, int, float*, float*,

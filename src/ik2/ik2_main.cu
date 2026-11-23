@@ -3803,14 +3803,15 @@ void tile_rows(const Mat& m, int r0, int n, const float* x32, int x_ld, int T, f
 // moe_combine_f32, argmax_rows); the dense products mv_q8p_rows over the F32 inputs (1a); the attention each row
 // split as the decode splits one token (1c); the experts the decode's tiles over the window's picks sorted by expert
 // (1b, lazy: an expert's repeat reads from L2).  FP16 KV only.  No graph (on gfx1151 one saves nothing).
-#else
+// (HIP: the FP16 overload below is compiled for fast_slots_launches too; --parallel > 1 alone reaches it and the AMD
+// build refuses that at start)
+#endif  // STRATA_USE_HIP
 // rows [r0, r0 + n) of a planar Q8_0 matrix times x16 [T][K] (FP16): y [T][ldy] (the tensor cores, q8_tile)
 void tile_rows(const Mat& m, int r0, int n, const uint16_t* x16, int T, float* y, int ldy) {
     if (!m.q8) die("the block path: a dense matrix that is not planar Q8_0");
     k::q8_tile(m.q8 + (size_t) r0 * m.K, m.q8d + (size_t) r0 * (m.K >> 5), n, m.K, x16, T, y, ldy, g_s);
 }
 
-#endif  // STRATA_USE_HIP
 void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 0) {
     const Config& c = M.c;
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel, S = T * c.K;
@@ -8124,8 +8125,13 @@ int main(int argc, char** argv) {
                     }
                     if (ring(v)) {   // (the snapshot's window, in host RAM already)
                         const size_t n = (size_t) std::min(pos, c.window) * row_b;
+#if defined(STRATA_USE_HIP)
+                        p->kv_k[v].assign(sn.kv_k[v].get(), sn.kv_k[v].get() + n);   // (the snapshot's buffers: unique_ptr)
+                        p->kv_v[v].assign(sn.kv_v[v].get(), sn.kv_v[v].get() + n);
+#else
                         p->kv_k[v].assign(sn.kv_k[v].begin(), sn.kv_k[v].begin() + (long) n);
                         p->kv_v[v].assign(sn.kv_v[v].begin(), sn.kv_v[v].begin() + (long) n);
+#endif  // STRATA_USE_HIP
                     } else {         // (the rows of positions 0 .. pos - 1)
                         const size_t n = (size_t) pos * row_b;
                         p->kv_k[v].resize(n);
@@ -8162,8 +8168,13 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < 4; ++i)
                     CU(cudaMemcpyAsync(sn.h[v * 4 + i], p.h[v * 4 + i].data(), 3 * cc[i] * 4, cudaMemcpyHostToDevice, g_s));
                 if (ring(v)) {
+#if defined(STRATA_USE_HIP)
+                    std::copy(p.kv_k[v].begin(), p.kv_k[v].end(), sn.kv_k[v].get());
+                    std::copy(p.kv_v[v].begin(), p.kv_v[v].end(), sn.kv_v[v].get());
+#else
                     std::copy(p.kv_k[v].begin(), p.kv_k[v].end(), sn.kv_k[v].begin());
                     std::copy(p.kv_v[v].begin(), p.kv_v[v].end(), sn.kv_v[v].begin());
+#endif  // STRATA_USE_HIP
                 } else {
                     const size_t n = (size_t) pos * row_b;
                     CU(cudaMemcpyAsync(g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, p.kv_k[v].data(), n, cudaMemcpyDefault, g_s));
