@@ -2275,7 +2275,29 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
 bool g_fast = false;        // set at load: every expert resident, one GPU, the dense weights as blocks (IK2_FAST=0: no)
 bool g_fast_want = false;
 bool g_graph = true;        // IK2_GRAPH=0: the resident path's launches one by one
+#if defined(STRATA_USE_HIP)
+// the resident path's fused small kernels (ik2_fuse.inc), a bit a set (bit s - 1 = set s): IK2_FUSE=1 = sets 1-4 (0xf),
+// IK2_FUSE_MASK=0x.. names the sets; IK2_AB (the generation loop) switches it between tokens.  0: today's kernels.
+// sets: 1 router+route, prep sinks, combine+gate, dyn taps pair | 2 loop gates + rms, window attention in one launch |
+// 3 moe_combine_conv rides the next attention residual | 4 prep folded into the window attention | 5 attention
+// residuals with every load at once | 6 router weights through LDS | 7 the full layers' combine skips empty partials
+// | 8 the loop gates' apply over 36 blocks a gate (with set 2) | 9 the FFN input's residual and the router in one launch
+// (non-loop visits, with set 1) | 10 the loop visits' FFN residual in the gate's dots launch (with set 2) | 11 the
+// loop visits' FFN gate rms in the router's launch (with sets 1 and 2) | 12 the loop visits' FFN gate apply + rms and
+// the router in one grid (with sets 1 and 2)
+int g_fuse_mask = 0;
+// The tuned AMD paths (IK2_FUSE_MASK, IK2_GRAPH 0, IK2_HBPF, IK2_MEMTRIM) are on by default only where they were
+// measured: gfx1151 (Ryzen AI Max, Strix Halo), one GPU.  Elsewhere they stay opt-in through their settings.
+bool amd_tuned_device(int n_gpu) {
+    if (n_gpu != 1) return false;
+    cudaDeviceProp pr{};
+    if (cudaGetDeviceProperties(&pr, 0) != cudaSuccess) return false;
+    return std::strncmp(pr.gcnArchName, "gfx1151", 7) == 0;
+}
+bool g_block = true;       // IK2_BLOCK=0: a verify window through forward() instead of the block path
+#else
 bool g_block = true;        // IK2_BLOCK=0: a verify window through forward() instead of the block path
+#endif  // STRATA_USE_HIP
 int g_attn_mma = 1;         // a token's attention on the tensor cores (IK2_ATTN_MMA=0: the scalar kernels; 2: the
                             // layers without a window only)
 int g_mma_split = 1;        // its blocks a K / V head (k::attn_decode_mma_blocks: the device filled once)
@@ -2400,13 +2422,51 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
     CU(cudaMemcpyAsync(W.tmp, W.emb_h, Cb, cudaMemcpyHostToDevice, g_s));
     k::rms(W.tmp, M.embd_norm, 1, C, c.eps, W.h, g_s);
     CU(cudaMemcpyAsync(W.pos, W.pos_h, 4, cudaMemcpyHostToDevice, g_s));
+#if defined(STRATA_USE_HIP)
+    // IK2_SKIP_SMALL=1 (a removal probe - the output is wrong on purpose): the per-visit small kernels and
+    // the FP16 products are not launched, so the time they leave is what fusing them could win at most.  route_token
+    // still runs (it writes the experts' pointers) on router logits held at 0, so every index stays in range.
+    static const bool skip_env = getenv("IK2_SKIP_SMALL") && atoi(getenv("IK2_SKIP_SMALL"));
+    // IK2_FUSE=1 / IK2_FUSE_MASK (g_fuse_mask, a bit a set): the small kernels of ik2_fuse.inc where their shapes fit
+    // (the same values to the bit, fewer launches); 0: the kernels below, as they were
+    const int fm = g_fuse_mask;
+    auto fs = [fm](int set) { return ((fm >> (set - 1)) & 1) != 0; };
+    // skip classes in g_fuse_mask bits 24-28 (removal probe a class, so IK2_AB prices each in one process; DESIGN
+    // "in-process skip bits"): 0 the visit's input side, 1 prep + attention + gate, 2 the FFN input side + router
+    // GEMV, 3 moe_combine, 4 dyn taps pair + a pass's attn_res_jobs.  IK2_SKIP_SMALL=1 = all five (0x1f000000).
+    const int skip = skip_env ? 0x1f : (fm >> 24) & 0x1f;
+    auto sk = [skip](int cls) { return ((skip >> cls) & 1) != 0; };
+    if (sk(2)) CU(cudaMemsetAsync(W.rlog, 0, (size_t) c.E * sizeof(float), g_s));
     auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
     int nb = 0, nb_pre = 0, n_bank = 0;
+    // (IK2_FUSE: a visit's moe_combine_conv waits for the next attention residual - the next visit's input or the
+    //  head's - and rides its launch; flushed as it was wherever something else reads the stream first)
+    bool pend = false;
+    float* pend_hist = nullptr;
+    const float* pend_w = nullptr;
+    auto flush = [&] {
+        if (pend) k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, pend_hist, pend_w, W.r, W.h, g_s);
+        pend = false;
+    };
+    auto moe_res = [&](const k::ResStates& st, int n, const float* q, int nq, float* res_out, const k::RmsOuts* outs) {
+        const bool ok = pend && k::fuse_moe_attn_res(W.y32, W.inv, W.wt, c.K, C, pend_hist, pend_w, W.r, W.h, st, n, q,
+                                                     nq, 1e-6f, c.eps, res_out, outs, g_s, fs(5));
+        if (ok) pend = false;
+        else flush();
+        return ok;
+    };
+#else
+    auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
+    int nb = 0, nb_pre = 0, n_bank = 0;
+#endif  // STRATA_USE_HIP
     for (int vis = 0; vis < c.n_visit; ++vis) {
         const int l = M.V[vis].l;
         Layer& Ly = bind_visit(M, vis, slot);
         // a looped core's passes (as forward()'s)
         const float* msg = nullptr;
+#if defined(STRATA_USE_HIP)
+        if (pend && ((c.n_pass > 1 && l == c.core0) || g_taps)) flush();
+#endif  // STRATA_USE_HIP
         if (c.n_pass > 1 && l == c.core0) {
             if (M.V[vis].pass == 0) {
                 nb_pre = nb;
@@ -2423,7 +2483,13 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
                 // layer's launch of its own was 7 us on one SM (a job a block: the same sums, 24 launches less a token)
                 k::ResStates st{};
                 for (int i = 0; i < n_bank; ++i) st.st[i] = W.lp_bank + (size_t) i * C;
+#if defined(STRATA_USE_HIP)
+                if (!sk(4))
+                    k::attn_res_jobs(st, n_bank, M.lp_query_all, 2, 2 * (c.core1 - c.core0), C, 1e-6f, W.lp_msg_all,
+                                     g_s);
+#else
                 k::attn_res_jobs(st, n_bank, M.lp_query_all, 2, 2 * (c.core1 - c.core0), C, 1e-6f, W.lp_msg_all, g_s);
+#endif  // STRATA_USE_HIP
             }
         }
         if (M.V[vis].pass > 0) msg = W.lp_msg_all + (size_t) (l - c.core0) * 4 * C;   // (q, k | v, MoE)
@@ -2441,8 +2507,21 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
             k::ResStates st{};
             for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
             st.st[nb] = W.h;
+#if defined(STRATA_USE_HIP)
+            if (msg && sk(0)) {   // (a combine waiting on this residual runs alone)
+                flush();
+                sep = true;
+            } else if (sk(0)) {
+                flush();
+            } else if (msg) {
+                if (!moe_res(st, nb + 1, Ly.res_score, Ly.n_res_q, W.lp_in, nullptr) &&
+                    !(fs(5) && k::fuse_attn_res_pf(st, nb + 1, Ly.res_score, Ly.n_res_q, C, 1e-6f, c.eps, W.lp_in,
+                                                   nullptr, g_s)))
+                    k::attn_res(st, nb + 1, Ly.res_score, Ly.n_res_q, 1, C, 1e-6f, W.lp_in, g_s);
+#else
             if (msg) {
                 k::attn_res(st, nb + 1, Ly.res_score, Ly.n_res_q, 1, C, 1e-6f, W.lp_in, g_s);
+#endif  // STRATA_USE_HIP
                 k::LoopGate gt[3];
                 for (int j = 0; j < 3; ++j)
                     gt[j] = {W.lp_in + (size_t)(Ly.n_res_q == 3 ? j : 0) * C,
@@ -2452,16 +2531,33 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
                              Ly.lp_gain[j],
                              x3[j],
                              {Ly.lp_bf[j][0], Ly.lp_bf[j][1], Ly.lp_bf[j][2]}};
+#if defined(STRATA_USE_HIP)
+                const k::RmsJobs rj{{x3[0], x3[1], x3[2]}, {nw[0], nw[1], nw[2]}, {x3[0], x3[1], x3[2]}};
+                if (!(fs(2) && k::fuse_loop_gates_rms(gt, 3, C, c.rank, 1e-6f, W.lp_g, rj, c.eps, g_s, fs(8)))) {
+                    k::loop_gates(gt, 3, 1, C, c.rank, 1e-6f, W.lp_g, g_s);
+                    k::rms_multi(rj, 3, C, c.eps, g_s);
+                }
+#else
                 k::loop_gates(gt, 3, 1, C, c.rank, 1e-6f, W.lp_g, g_s);
                 k::rms_multi(k::RmsJobs{{x3[0], x3[1], x3[2]}, {nw[0], nw[1], nw[2]}, {x3[0], x3[1], x3[2]}}, 3, C, c.eps,
                              g_s);
+#endif  // STRATA_USE_HIP
                 sep = true;
             } else if (l > 0) {
                 k::RmsOuts outs{};
                 uint16_t* y16[3] = {W.x16, W.xk16, W.xv16};
                 for (int j = 0; j < Ly.n_res_q; ++j) outs.w[j] = nw[j], outs.y16[j] = y16[j], outs.y32[j] = x3[j];
+#if defined(STRATA_USE_HIP)
+                if (!moe_res(st, nb + 1, Ly.res_score, Ly.n_res_q, nullptr, &outs) &&
+                    !(fs(5) && k::fuse_attn_res_pf(st, nb + 1, Ly.res_score, Ly.n_res_q, C, 1e-6f, c.eps, nullptr,
+                                                   &outs, g_s)))
+                    k::attn_res_rms_f16(st, nb + 1, Ly.res_score, Ly.n_res_q, 1, C, 1e-6f, c.eps, outs, g_s);
+            } else {
+                flush();
+#else
                 k::attn_res_rms_f16(st, nb + 1, Ly.res_score, Ly.n_res_q, 1, C, 1e-6f, c.eps, outs, g_s);
             } else {
+#endif  // STRATA_USE_HIP
                 for (int j = 0; j < (sep ? 3 : 1); ++j) k::rms(W.h, nw[j], 1, C, c.eps, x3[j], g_s);
             }
         }
@@ -2491,8 +2587,16 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
             mv1(m, W.xq, W.qkv);
             q_p = W.qkv, r_p = q_p + HD, gate_p = r_p + HR;
             k_p = W.kk, v_p = W.vv, kd_p = W.dyn, vd_p = W.dyn + (size_t) c.KV * 4;
+#if defined(STRATA_USE_HIP)
+            if (!sk(4) && !(fs(1) && k::fuse_mv_f16_pair(Ly.sc_k_dyn16, W.xk, kd_p, c.KV * 4, Ly.sc_v_dyn16, W.xv,
+                                                              vd_p, c.KV * 4, C, g_s))) {
+                k::mv_f16(Ly.sc_k_dyn16, c.KV * 4, C, W.xk, kd_p, g_s);
+                k::mv_f16(Ly.sc_v_dyn16, c.KV * 4, C, W.xv, vd_p, g_s);
+            }
+#else
             k::mv_f16(Ly.sc_k_dyn16, c.KV * 4, C, W.xk, kd_p, g_s);
             k::mv_f16(Ly.sc_v_dyn16, c.KV * 4, C, W.xv, vd_p, g_s);
+#endif  // STRATA_USE_HIP
             mv1c(Ly.wk, W.xk, k_p, k::MvConv{0, KD, Ly.h_k, Ly.sc_k, kd_p, c.KV, nullptr, W.kconv});
             mv1c(Ly.wv, W.xv, v_p, k::MvConv{0, KD, Ly.h_v, Ly.sc_v, vd_p, c.KV, nullptr, W.vconv});
         }
@@ -2506,7 +2610,13 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
         const int ring = Ly.sliding ? Ly.kv_cap : 0;
         const int ns = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : g_mma_split;
         uint16_t* q16 = mma ? W.x16 : nullptr;
+#if defined(STRATA_USE_HIP)
+        bool gated = false;   // (IK2_FUSE: the gate rode the attention's combine)
+        if (sk(1)) {
+        } else if (g_kv_fp8) {
+#else
         if (g_kv_fp8) {
+#endif  // STRATA_USE_HIP
             k::prep_qkv_r_fp8_at(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap,
                                  k_scale, v_scale, q16, g_s, Ly.sink16, W.xq, C, W.sink, Ly.page_table);
@@ -2518,25 +2628,58 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
                 k::attn_decode_fp8_at(q_p, r_p, W.sink, Ly.kc8, Ly.vc8, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
                                       qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
                                       W.o, g_s, Ly.page_table);
+#if defined(STRATA_USE_HIP)
+        } else if (fs(4) && !mma && Ly.sliding &&
+                   k::fuse_prep_attn_f16_at_gate(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, c.H,
+                                                 c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding,
+                                                 c.alpha, c.n_floor, Ly.kv_cap, Ly.sink16, W.xq, C, W.sink, qk_scale,
+                                                 Ly.rel_proj, extent, window, P, W.lg, gate_p, W.o,
+                                                 W.x16, g_s)) {
+            gated = true;   // (prep, the attention and the gate: one launch)
+        } else {
+            if (!(fs(1) && k::fuse_prep_qkv_r_f16_at(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, c.H,
+                                                    c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos,
+                                                    !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, q16, g_s, Ly.sink16,
+                                                    W.xq, C, W.sink)))
+                k::prep_qkv_r_f16_at(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, c.H, c.KV, c.D,
+                                     c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor,
+                                     Ly.kv_cap, q16, g_s, Ly.sink16, W.xq, C, W.sink, Ly.page_table);
+#else
         } else {
             k::prep_qkv_r_f16_at(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, q16,
                                  g_s, Ly.sink16, W.xq, C, W.sink, Ly.page_table);
+#endif  // STRATA_USE_HIP
             if (mma)
                 k::attn_decode_mma_f16(q16, r_p, W.sink, Ly.kc, Ly.vc, ring, c.H, c.KV, W.pos, 0, ns, qk_scale,
                                        Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, W.x16, g_s,
                                        Ly.page_table);
+#if defined(STRATA_USE_HIP)
+            else if ((fs(2) && k::fuse_attn_one_f16_at_gate(q_p, r_p, W.sink, Ly.kc, Ly.vc, Ly.sliding ? Ly.kv_cap : 0,
+                                                           c.H, c.KV, W.pos, P, qk_scale, Ly.rel_proj, c.d_rel, extent,
+                                                           window, W.lg, gate_p, W.o, W.x16, g_s)) ||
+                     (fs(1) && k::fuse_attn_decode_f16_at_gate(q_p, r_p, W.sink, Ly.kc, Ly.vc,
+                                                              Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
+                                                              qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
+                                                              gate_p, W.o, W.x16, g_s, fs(7))))
+                gated = true;
+#endif  // STRATA_USE_HIP
             else
                 k::attn_decode_f16_at(q_p, r_p, W.sink, Ly.kc, Ly.vc, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
                                       qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s, Ly.page_table);
         }
+#if defined(STRATA_USE_HIP)
+        if (!mma && !sk(1) && !gated) k::gate_mul_f16(W.o, gate_p, (size_t) HD, W.x16, true, g_s);   // (the tensor cores' merge has it)
+#else
         if (!mma) k::gate_mul_f16(W.o, gate_p, (size_t) HD, W.x16, true, g_s);   // (the tensor cores' merge has it)
+#endif  // STRATA_USE_HIP
         // the output projection with its short conv (and the stream added, but where a block starts: there the
         // stream joins the blocks and starts again)
         const bool first = l % c.block == 0;
         if (first) CU(cudaMemcpyAsync(blk(nb), W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
         mv1c(Ly.wo, W.o, W.tmp, k::MvConv{0, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, first ? nullptr : W.h, W.r});
         if (first) ++nb;
+#if !defined(STRATA_USE_HIP)
         // the MoE: its input, the router and the picks' tables on the device, the experts
         {
             k::ResStates st{};
@@ -2560,6 +2703,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
             }
         }
         k::mv_f16(Ly.router16, c.E, C, W.xq, W.rlog, g_s);
+#endif  // !STRATA_USE_HIP
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + c.K);
         static const int limb = getenv("IK2_EXPERT_LIMB") ? atoi(getenv("IK2_EXPERT_LIMB")) : 0;
@@ -2570,9 +2714,77 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
             c.F % 64 == 0 && (((limb & 2) && Ly.ty[2] == k::kNVFP4) || ((limb & 8) && Ly.ty[2] == k::kQ8_0));
         static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
         const bool exp_tc = exp_mma && !fast_gate && !fast_down && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
+#if defined(STRATA_USE_HIP)
+        bool res_routed = false;   // (set 9: the FFN input's residual and the router were one launch)
+        // the MoE: its input, the router and the picks' tables on the device, the experts
+        {
+            k::ResStates st{};
+            for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
+            st.st[nb] = W.r;
+            if (sk(2)) {
+            } else if (msg) {
+                const k::LoopGate gt{W.xq,
+                                     msg + (size_t)3 * C,
+                                     Ly.lp_down[3],
+                                     Ly.lp_forget[3],
+                                     Ly.lp_gain[3],
+                                     W.xq,
+                                     {Ly.lp_bf[3][0], Ly.lp_bf[3][1], Ly.lp_bf[3][2]}};
+                const k::RmsJobs rj{{W.xq}, {Ly.ffn_norm}, {W.xq}};
+                // (set 11: the gate's rms rides the router's launch - the gate's y into W.lp_in, free here; set 10:
+                //  the residual rides the gate's dots launch)
+                const bool r11 = fs(11) && fs(1) && fs(2) && !fast_gate && !exp_tc;
+                const bool res_gated = !r11 && fs(10) && fs(2) &&
+                                       k::fuse_res_loop_gate_rms(st, nb + 1, Ly.ffn_res_score, 1e-6f, W.xq, gt, C,
+                                                                 c.rank, 1e-6f, W.lp_g, rj, c.eps, g_s, fs(8));
+                if (!res_gated &&
+                    !(fs(5) && k::fuse_attn_res_pf(st, nb + 1, Ly.ffn_res_score, 1, C, 1e-6f, c.eps, W.xq, nullptr, g_s)))
+                    k::attn_res(st, nb + 1, Ly.ffn_res_score, 1, 1, C, 1e-6f, W.xq, g_s);
+                if (!r11 && fs(12) && fs(1) && fs(2) && !fast_gate && !exp_tc)   // (set 12: apply + rms + router, 1 grid)
+                    res_routed = k::fuse_loop_gate_router(gt, C, c.rank, 1e-6f, W.lp_g, rj, c.eps, Ly.router16, W.rlog,
+                                                          Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob,
+                                                          Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], rtop, rw, W.blob,
+                                                          W.tok, W.inv, W.sg, W.su, W.wt, g_s);
+                if (r11) {
+                    const k::LoopGate g11{W.xq, gt.m, gt.D, gt.F, gt.G, W.lp_in, {gt.compact[0], gt.compact[1], gt.compact[2]}};
+                    res_routed = k::fuse_loop_gate_rms_router(g11, C, c.rank, 1e-6f, W.lp_g, Ly.ffn_norm, c.eps, W.xq,
+                                                              Ly.router16, W.rlog, Ly.probs_b, c.E, c.K, c.route_scale,
+                                                              Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2],
+                                                              rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s);
+                }
+                if (!res_gated && !res_routed &&
+                    !(fs(2) && k::fuse_loop_gates_rms(&gt, 1, C, c.rank, 1e-6f, W.lp_g, rj, c.eps, g_s, fs(8)))) {
+                    k::loop_gates(&gt, 1, 1, C, c.rank, 1e-6f, W.lp_g, g_s);
+                    k::rms(W.xq, Ly.ffn_norm, 1, C, c.eps, W.xq, g_s);
+                }
+            } else {
+                k::RmsOuts outs{};
+                outs.w[0] = Ly.ffn_norm, outs.y16[0] = W.x16, outs.y32[0] = W.xq;
+                res_routed = fs(9) && fs(1) && !fast_gate && !exp_tc &&
+                             k::fuse_res_router_route(st, nb + 1, Ly.ffn_res_score, C, 1e-6f, c.eps, outs, Ly.router16,
+                                                      W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob,
+                                                      Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], rtop, rw, W.blob,
+                                                      W.tok, W.inv, W.sg, W.su, W.wt, g_s);
+                if (!res_routed &&
+                    !(fs(5) && k::fuse_attn_res_pf(st, nb + 1, Ly.ffn_res_score, 1, C, 1e-6f, c.eps, nullptr, &outs, g_s)))
+                    k::attn_res_rms_f16(st, nb + 1, Ly.ffn_res_score, 1, 1, C, 1e-6f, c.eps, outs, g_s);
+            }
+        }
+        const bool routed = res_routed || (fs(1) && !sk(2) && !fast_gate && !exp_tc &&
+                            k::fuse_router_route(Ly.router16, W.xq, C, W.rlog, Ly.probs_b, c.E, c.K, c.route_scale,
+                                                 Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], rtop, rw, W.blob,
+                                                 W.tok, W.inv, W.sg, W.su, W.wt, g_s, fs(6)));
+        if (!routed) {
+            if (!sk(2)) k::mv_f16(Ly.router16, c.E, C, W.xq, W.rlog, g_s);
+            k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
+                           Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
+                           fast_gate ? W.gu32 : nullptr, q8_gate, exp_tc ? (uint16_t*) W.gu32 : nullptr);
+        }
+#else
         k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
                        Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
                        fast_gate ? W.gu32 : nullptr, q8_gate, exp_tc ? (uint16_t*) W.gu32 : nullptr);
+#endif  // STRATA_USE_HIP
 
 #ifdef IK2_HOST_AVX2
         if ((tier_active || host_plan.forced) && !host_plan.active.empty() && host_plan.active[l]) {
@@ -2599,30 +2811,70 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
                 k::experts_gate_up_swiglu_mma(W.blob, c.K, Ly.eb[0], (const uint16_t*) W.gu32, C, c.F, W.sg, W.su,
                                               c.gate_cap, c.up_cap, W.h16, g_s);
                 k::experts_down_mma(W.blob, c.K, Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+#if defined(STRATA_USE_HIP)
+            } else if (!fast_gate && !fast_down && fs(16) && c.K <= 8 &&
+                       k::experts_nv_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {   // (set 16: one launch a visit)
+                k::experts_nv_visit(W.blob, W.tok, c.K, Ly.eb[0], Ly.eb[0] + Ly.eb[1], W.xq, C, c.F, W.sg, W.su,
+                                    c.gate_cap, c.up_cap, W.h16, W.y32, g_s);
+#endif  // STRATA_USE_HIP
             } else {
             if (fast_gate)
                 k::expert_limb_mv(true, W.blob, Ly.eb[0], C, c.F, c.K, W.xq, W.h16, W.y32, W.sg, W.su, c.gate_cap,
                                   c.up_cap, W.gu32, g_s, q8_gate, true);
+#if defined(STRATA_USE_HIP)
+            else if (fs(13) && k::experts_nv_fits(Ly.ty[0], Ly.ty[1], k::kNVFP4, C, c.F))   // (set 13: x in registers)
+                k::experts_gate_up_swiglu_nv(W.blob, W.tok, c.K, Ly.eb[0], W.xq, C, c.F, W.sg, W.su, c.gate_cap,
+                                             c.up_cap, W.h16, g_s);
+            else if (fs(15) && Ly.ty[0] == Ly.ty[1] && k::experts_q8_fits(Ly.ty[0], C, c.F))   // (set 15: Q8_0)
+                k::experts_gate_up_swiglu_q8(W.blob, W.tok, c.K, Ly.eb[0], W.xq, C, c.F, W.sg, W.su, c.gate_cap,
+                                             c.up_cap, W.h16, g_s);
+#endif  // STRATA_USE_HIP
             else
                 k::experts_gate_up_swiglu(W.blob, W.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, W.sg, W.su,
                                           c.gate_cap, c.up_cap, W.h16, g_s);
             if (fast_down && C % 2 == 0)
                 k::expert_limb_mv(false, W.blob, Ly.eb[0] + Ly.eb[1], C, c.F, c.K, W.xq, W.h16, W.y32, W.sg, W.su,
                                   c.gate_cap, c.up_cap, W.gu32, g_s, Ly.ty[2] == k::kQ8_0, false);
+#if defined(STRATA_USE_HIP)
+            else if (fs(14) && k::experts_nv_fits(k::kNVFP4, k::kNVFP4, Ly.ty[2], C, c.F))   // (set 14)
+                k::experts_down_nv(W.blob, c.K, Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+            else if (fs(15) && k::experts_q8_fits(Ly.ty[2], C, c.F))
+                k::experts_down_q8(W.blob, c.K, Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+#endif  // STRATA_USE_HIP
             else
                 k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
             }
         }
+#if defined(STRATA_USE_HIP)
+        if (sk(3)) {
+        } else if (fs(3)) {
+            pend = true, pend_hist = Ly.h_mlp, pend_w = Ly.sc_mlp;
+        } else {
+            k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
+        }
+    }
+    if (out_mode == OutMode::kNone) {
+        flush();
+        return;
+    }
+#else
         k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
     }
     if (out_mode == OutMode::kNone) return;
+#endif  // STRATA_USE_HIP
     {   // the head
         k::ResStates st{};
         for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
         st.st[nb] = W.h;
         k::RmsOuts outs{};
         outs.w[0] = M.out_norm, outs.y16[0] = W.x16, outs.y32[0] = W.xq;
+#if defined(STRATA_USE_HIP)
+        if (!moe_res(st, nb + 1, M.out_res_score, 1, nullptr, &outs) &&
+            !(fs(5) && k::fuse_attn_res_pf(st, nb + 1, M.out_res_score, 1, C, 1e-6f, c.eps, nullptr, &outs, g_s)))
+            k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, 1, C, 1e-6f, c.eps, outs, g_s);
+#else
         k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, 1, C, 1e-6f, c.eps, outs, g_s);
+#endif  // STRATA_USE_HIP
         if (g_taps)
             CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, Cb, cudaMemcpyDeviceToDevice, g_s));
         mv1(M.out_w, W.xq, W.logits);
@@ -4575,6 +4827,9 @@ int main(int argc, char** argv) {
         else if (a == "--dump") dump = next();
         else die("unknown argument " + a);
     }
+#if defined(STRATA_USE_HIP)
+    const bool amd_tuned = amd_tuned_device(n_gpu);
+#endif  // STRATA_USE_HIP
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
     g_mv = !getenv("IK2_MV") || std::atoi(getenv("IK2_MV"));
@@ -4765,7 +5020,18 @@ int main(int argc, char** argv) {
     // card)?  Then they all stay there: the dense weights are kept as the GGUF's blocks unless IK2_DENSE says otherwise
     // (half an FP16 copy's bytes, a token's products straight over them) and tokens take the resident path
     // (IK2_FAST=0: off; IK2_GRAPH=0: its launches one by one instead of a CUDA graph a token).
+#if defined(STRATA_USE_HIP)
+    // (gfx1151: graph off - the launches one by one are 0.5 ms a token faster there; the fused sets 0xf14f)
+    g_graph = getenv("IK2_GRAPH") ? std::atoi(getenv("IK2_GRAPH")) != 0 : !amd_tuned;
+    g_fuse_mask = getenv("IK2_FUSE") && std::atoi(getenv("IK2_FUSE")) ? 0xf : amd_tuned ? 0xf14f : 0;
+    if (getenv("IK2_FUSE_MASK")) g_fuse_mask = (int) std::strtol(getenv("IK2_FUSE_MASK"), nullptr, 0);
+    if (getenv("IK2_AB") && std::atoi(getenv("IK2_AB")) > 0 && g_graph) {
+        std::printf("IK2_AB: the launches one by one (IK2_GRAPH=0) - a graph would keep its first arm's kernels\n");
+        g_graph = false;
+    }
+#else
     g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
+#endif  // STRATA_USE_HIP
     g_block = !(getenv("IK2_BLOCK") && !std::atoi(getenv("IK2_BLOCK")));
     g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
@@ -7284,6 +7550,19 @@ int main(int argc, char** argv) {
     int suffix_at = 0;
     SuffixStats suffix_stats;
     int next_placement = kPlacementInterval;
+#if defined(STRATA_USE_HIP)
+    // IK2_AB=K (an A/B in one process, the model loaded once): the fuse masks IK2_AB_A and IK2_AB_B
+    // (g_fuse_mask's bits) take blocks of K decode tokens in the order A B B A A B B A ..., so each pair (blocks 2p,
+    // 2p + 1) holds one block of each and a linear drift (the context grows every token) cancels over the pairs; at
+    // the end each arm's ms a token over its full blocks and the pairs' B - A, both without pair 0 (each arm's first
+    // block)
+    const int ab_k = getenv("IK2_AB") ? std::max(0, std::atoi(getenv("IK2_AB"))) : 0;
+    const int ab_mask[2] = {getenv("IK2_AB_A") ? (int) std::strtol(getenv("IK2_AB_A"), nullptr, 0) : 0,
+                            getenv("IK2_AB_B") ? (int) std::strtol(getenv("IK2_AB_B"), nullptr, 0) : 0};
+    auto ab_arm = [](int b) { return ((b + 1) >> 1) & 1; };
+    std::vector<double> ab_t;   // a block's seconds
+    std::vector<int> ab_n;      // its tokens
+#endif  // STRATA_USE_HIP
     for (int i = 0, best = first_best; i < gen && !drafter; ++i) {
         if (g_managed_experts && i >= next_placement) {
             place_decode(M, (int)prompt.size() + i);
@@ -7314,8 +7593,20 @@ int main(int argc, char** argv) {
         }
         std::vector<int> ag;
         if (lo) logits.clear();
+#if defined(STRATA_USE_HIP)
+        if (ab_k) g_fuse_mask = ab_mask[ab_arm(i / ab_k)];
+        const double t_ab = now();
         forward(M, &tok, 1, (int) prompt.size() + i, false, lo ? OutMode::kLogits : OutMode::kArgmax, std::string(),
                 logits, &ag, t_exp);
+        if (ab_k) {
+            const size_t b = (size_t) (i / ab_k);
+            if (ab_t.size() <= b) ab_t.resize(b + 1, 0.0), ab_n.resize(b + 1, 0);
+            ab_t[b] += now() - t_ab, ++ab_n[b];
+        }
+#else
+        forward(M, &tok, 1, (int) prompt.size() + i, false, lo ? OutMode::kLogits : OutMode::kArgmax, std::string(),
+                logits, &ag, t_exp);
+#endif  // STRATA_USE_HIP
         if (lo) {
             std::fwrite(logits.data(), sizeof(float), (size_t) c.n_vocab, lo);
             best = (int) (std::max_element(logits.begin(), logits.begin() + c.n_vocab) - logits.begin());
@@ -7324,6 +7615,52 @@ int main(int argc, char** argv) {
         }
     }
     if (lo) std::fclose(lo);
+#if defined(STRATA_USE_HIP)
+    if (ab_k) {
+        // a block's ms a token; each arm's mean and SE over its full blocks, pair 0 dropped; the pairs' B - A
+        std::vector<double> ms[2], d;
+        std::printf("ab: K %d, A 0x%x, B 0x%x, blocks (ms a token, arm):", ab_k, ab_mask[0], ab_mask[1]);
+        for (size_t b = 0; b < ab_t.size(); ++b) {
+            if (ab_n[b] < ab_k) continue;
+            std::printf(" %.3f%c", ab_t[b] * 1e3 / ab_n[b], "AB"[ab_arm((int) b)]);
+            if (b >= 2) ms[ab_arm((int) b)].push_back(ab_t[b] * 1e3 / ab_n[b]);
+            if (b >= 2 && (b & 1) && ab_n[b - 1] == ab_k) {
+                const double tb = ab_t[ab_arm((int) b) ? b : b - 1], ta = ab_t[ab_arm((int) b) ? b - 1 : b];
+                d.push_back((tb - ta) * 1e3 / ab_k);
+            }
+        }
+        std::printf("\n");
+        auto mse = [](const std::vector<double>& v, double& m, double& se) {
+            m = 0, se = 0;
+            for (double x : v) m += x;
+            m /= std::max<size_t>(1, v.size());
+            for (double x : v) se += (x - m) * (x - m);
+            se = v.size() > 1 ? std::sqrt(se / (v.size() - 1) / v.size()) : 0;
+        };
+        // (the box's tokens are two-state - ~21.7 or ~24.9 ms, runs of 3-15 tokens - with bursts of 40-80 ms: a pair
+        //  across a switch or a burst is +-3 .. 60 ms, either sign; so the verdict is the pairs' 20 % trimmed mean
+        //  and its winsorized SE (Yuen), the plain mean beside it)
+        auto trim = [](std::vector<double> v, double& m, double& se) {
+            std::sort(v.begin(), v.end());
+            const size_t n = v.size(), g = n / 5;
+            m = 0, se = 0;
+            if (n < 5) return;
+            for (size_t i = g; i < n - g; ++i) m += v[i];
+            m /= (double) (n - 2 * g);
+            double wm = 0, wv = 0;
+            for (size_t i = 0; i < n; ++i) wm += v[std::clamp(i, g, n - g - 1)];
+            wm /= (double) n;
+            for (size_t i = 0; i < n; ++i) wv += (v[std::clamp(i, g, n - g - 1)] - wm) * (v[std::clamp(i, g, n - g - 1)] - wm);
+            se = std::sqrt(wv / (n - 1)) / ((double) (n - 2 * g) / n * std::sqrt((double) n));
+        };
+        double ma, sa, mb, sb, md, sd, tm, ts;
+        mse(ms[0], ma, sa), mse(ms[1], mb, sb), mse(d, md, sd), trim(d, tm, ts);
+        std::printf("ab: A %.3f ms/token (SE %.3f, %zu blocks), B %.3f (SE %.3f, %zu blocks); B - A %+.3f ms/token "
+                    "(SE %.3f, %zu pairs); trimmed 20%% %+.3f ms/token (SE %.3f) = %+.2f%%\n",
+                    ma, sa, ms[0].size(), mb, sb, ms[1].size(), md, sd, d.size(), tm, ts,
+                    ma > 0 ? 100.0 * tm / ma : 0.0);
+    }
+#endif  // STRATA_USE_HIP
     if (!force.empty())
         std::printf("forced: %d tokens fed, the model's pick agreed with the next one %d times (%.2f%%)\n",
                     (int) std::min<size_t>(force.size(), out.size()), agree,
