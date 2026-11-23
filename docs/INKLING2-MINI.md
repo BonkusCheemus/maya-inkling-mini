@@ -4,7 +4,7 @@
 
 ## Quick start
 
-You need Linux, an RTX 3090 or another 24 GB `sm_86` card, CUDA 12.8 with `nvcc` on the `PATH`, CMake 3.21 or newer, Ninja, and Python 3.10 or newer. The model takes 17.6 GB on disk and 23.6 GiB of VRAM at the full context.
+You need Linux or Windows (MSVC), an NVIDIA GPU (`sm_80` or newer; 24 GB for all experts in VRAM, or 8 GB+ with `ik2-mini-8gb.json`) with CUDA 12.8+ / 13.x and `nvcc` on the `PATH`, or an AMD GPU with ROCm/HIP, CMake 3.21 or newer, Ninja, and Python 3.10 or newer. The model takes 17.6 GB on disk and 23.6 GiB of VRAM at the full 344K context.
 
 ### 1. Build the engine
 
@@ -16,7 +16,18 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON 
 cmake --build build -j 24 --target maya-ik2
 ```
 
-CMake downloads the pinned llama.cpp commit for ggml on its own. If the system has more than one CUDA, point CMake at the right one: `-DCUDAToolkit_ROOT=/usr/local/cuda-12.8 -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc`.
+CMake downloads the pinned llama.cpp commit for ggml on its own. Set `-DCMAKE_CUDA_ARCHITECTURES` to your GPU (`86` for RTX 3090, `89` for RTX 4090, `120` for RTX 5090 / 5070). If the system has more than one CUDA, point CMake at the right one: `-DCUDAToolkit_ROOT=/usr/local/cuda-12.8 -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc`.
+
+On **Windows (MSVC + CUDA 13.x)**, run the same CMake command from a Developer Command Prompt (pass `-DSTRATA_NATIVE_EXPERTS=OFF -DSTRATA_BUILD_TESTS=OFF` if you only want `maya-ik2`).
+
+On **AMD GPUs (ROCm / HIP)**, enable the HIP build with `STRATA_HIP_IK2_SPIKE=ON` (tested on RX 9070 XT `gfx1201` with ROCm 10.2.0):
+
+```bash
+cmake -S . -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_HIP=ON -DSTRATA_PREFILL_MMQ=ON -DSTRATA_HIP_IK2_SPIKE=ON \
+  -DAMDGPU_TARGETS=gfx1201 -DCMAKE_HIP_ARCHITECTURES=gfx1201
+cmake --build build-hip -j 24 --target maya-ik2
+```
 
 ### 2. Build the image encoder (optional)
 
@@ -61,7 +72,7 @@ To pick the card, set `CUDA_VISIBLE_DEVICES` before the command.
 
 ## Configs
 
-All 4 are in [`docs/inkling2-mini/`](inkling2-mini/). For a card with 8 GB, see [An 8 GB card](#an-8-gb-card).
+All 5 configs are in [`docs/inkling2-mini/`](inkling2-mini/). For details on the 8 GB card setup, see [An 8 GB card](#an-8-gb-card).
 
 | Config | Context | Drafter | Image encoder | VRAM |
 |---|---:|---|---|---:|
@@ -69,6 +80,7 @@ All 4 are in [`docs/inkling2-mini/`](inkling2-mini/). For a card with 8 GB, see 
 | `ik2-mini-long.json` | 344,064 | no | CPU | 23.3 GiB at start, 23.6 at 340K tokens |
 | `ik2-mini-text.json` | 344,064 | no | none | the same |
 | `ik2-mini-gpu-vision.json` | 262,144 | no | GPU, 1.3 GiB | 23.7 GiB |
+| `ik2-mini-8gb.json` | 16,384 | no | none | ~7 GiB (experts in host RAM) |
 
 **Check that every expert stays in VRAM.** The VRAM column is with nothing else on the card. If another program
 holds some of it, the configs above may not fit, and then the experts stay in host memory and decode runs at 50
@@ -95,6 +107,8 @@ The `env` block in the configs:
 With `--draft` the engine decides every step whether to draft. A window of B tokens is worth (1 - a^B) / (1 - a) tokens, where a is how often recent drafts were accepted; it drafts when that, over the window's measured time, beats a plain token's time, and after 8 plain tokens it drafts once to look again. `IK2_DRAFT_WIDTH` (default 5) sets the widest window, `IK2_DRAFT_ADAPT=0` always drafts at that width.
 
 **Concurrent requests (`--parallel N`).** Passing `--parallel N` (`2` to `8`, single GPU, non-managed KV) in the config's `args` serves up to `N` requests at once (`READY ... multi=N`, `INFO ... parallel=N`). The 8 global-attention visits share one paged KV pool of `--max-context` tokens (256-token pages, reused across turns by prefix match and evicted LRU from idle slots when needed); waiting requests queue until a slot and pages are free. Each extra slot adds its own sliding-window KV ring (~240 MiB at `--chunk 2048` or ~120 MiB at `--chunk 512`, FP8) plus ~48 MiB for the multi-slot CUDA graphs. On a 24 GB card, `--parallel 4` at 262,144 tokens stays resident without a drafter; with `--draft`, use `--chunk 512` and `IK2_DRAFT_CTX=8192` (or lower `--max-context` as the startup note suggests). When only one slot is decoding, `--draft` still speculates on that slot; when 2 or more decode together, they share one batched CUDA graph per batch size.
+
+**Keeping conversations in host RAM (`IK2_SLOT_KEEP`).** On the default `--parallel 1` path, `IK2_SLOT_KEEP` (default `8`, `0` to turn off) parks a displaced conversation of 2,048+ tokens in host RAM before another request (for example an agent's side summary, sub-agent, or image caption) overwrites VRAM. It saves the global KV rows, sliding windows, conv histories, and drafter context (`IK2_SLOT_RAM_GB` caps memory; default is half of free RAM above a 4 GiB reserve). When the original conversation comes back, its prefix is copied back instead of re-prefilled: on an RTX 4090, a 54.5K-token chat takes 1.15 GiB of RAM and restores in ~70 ms (turn in 0.5 to 0.7 s against 12.6 s to re-read the prompt) with identical greedy tokens and full drafter speed.
 
 The tensor core expert kernels are on by default; `IK2_EXPERT_MMA=0` in `env` switches back to the scalar ones, which give the same logits bit for bit as the older builds. Every setting is listed in [SETTINGS.md](SETTINGS.md).
 
@@ -206,4 +220,4 @@ The branch also carries experimental code that the configs above leave off: a 1,
 
 ## Credits
 
-[Project Maya](https://github.com/mw00/project-maya) by Peasant Smith and the Maya contributors is the base, and `maya-ik2` began as the Inkling 2 Small engine of Maya's pull requests #981 and #1079. [Strata](https://github.com/Niko1221/Strata) by Niko1221 is where Maya came from. The model is by [Thinking Machines](https://huggingface.co/thinkingmachines/Inkling-2-Mini), the GGUF by [Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), ggml and `mtmd` by the llama.cpp authors. The Windows / CUDA 13 build and two-GPU expert parallel are by [@cobra91](https://github.com/cobra91). The Windows fixes on top are by [@PrasoonPratham](https://github.com/PrasoonPratham), the 8 GB card path by [@ImagineNotChetng](https://github.com/ImagineNotChetng).
+[Project Maya](https://github.com/mw00/project-maya) by Peasant Smith and the Maya contributors is the base, and `maya-ik2` began as the Inkling 2 Small engine of Maya's pull requests #981 and #1079. [Strata](https://github.com/Niko1221/Strata) by Niko1221 is where Maya came from. The model is by [Thinking Machines](https://huggingface.co/thinkingmachines/Inkling-2-Mini), the GGUF by [Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), ggml and `mtmd` by the llama.cpp authors. The Windows / CUDA 13 build and two-GPU expert parallel are by [@cobra91](https://github.com/cobra91), Windows MSVC hardening by [@PrasoonPratham](https://github.com/PrasoonPratham) (#3), the 8 GB card path by [@ImagineNotChetng](https://github.com/ImagineNotChetng) (#4), `--parallel` continuous batching by [@joeldeteves](https://github.com/joeldeteves) (#5), the AMD HIP build by [@DeseretSaint](https://github.com/DeseretSaint) (#7), and Windows `serve_multi` plus `IK2_SLOT_KEEP` conversation caching by [@mkultraware](https://github.com/mkultraware) (#10, #11).
