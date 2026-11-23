@@ -98,6 +98,9 @@ static inline cudaError_t memAdviseCompat(const void* devPtr, size_t count, cuda
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#if defined(STRATA_USE_HIP)
+#include <source_location>
+#endif  // STRATA_USE_HIP
 
 namespace {
 
@@ -408,12 +411,422 @@ struct Prof {
     }
 } g_pf;
 
+#if defined(STRATA_USE_HIP)
+// ---- memory: IK2_MEMLOG's ledger and IK2_MEMTRIM's cuts (docs/AMD_INKLING2_GFX1151.md)
+// IK2_MEMTRIM (a bit a cut; unset / 0 = every allocation as before): 0x01 the expert bounce ring freed after the
+// resident load; 0x02 the full layers' K / V reserved at their size and backed as the context grows (VMM, else 2 MiB
+// registered host cells); 0x04 (--serve) the work set in one VMM reservation, its memory released after IK2_IDLE_S s
+// (60) without a request and mapped back at the same addresses (zeroed) when the next comes; 0x08 the expert bytes'
+// page cache dropped after the resident copy; 0x10 (--serve) the snapshots' sliding-KV host buffers left
+// uninitialized (only the rows a save writes take RAM); 0x20 with 0x02: host cells, not VMM.
+// IK2_MEMLOG=1 (stderr): the allocations by kind and call site (ik2_main.cu line) with a running total, cudaMemGetInfo,
+// VmRSS, MemAvailable and GTT used - after the runtime's start, the dense weights + KV, the load and the first prompt.
+int g_memtrim = 0;
+bool g_memlog = false;
+bool g_arena_off = false, g_arena_released = false;   // (0x04: the work set's reservation refused / unmapped)
+struct MemRow {
+    size_t bytes = 0;
+    long n = 0;
+};
+std::map<std::pair<std::string, int>, MemRow> g_memrows;   // (kind, line)
+std::unordered_map<const void*, std::pair<std::pair<std::string, int>, size_t>> g_memptr;
+std::mutex g_memlog_m;   // (the pinned path's allocation threads)
+void memlog_add(const char* kind, const void* p, size_t bytes, int line) {
+    if (!g_memlog) return;
+    std::lock_guard<std::mutex> lk(g_memlog_m);
+    const auto key = std::make_pair(std::string(kind), line);
+    MemRow& r = g_memrows[key];
+    r.bytes += bytes, ++r.n;
+    if (p) g_memptr[p] = {key, bytes};
+}
+void memlog_free(const void* p) {
+    if (!g_memlog || !p) return;
+    std::lock_guard<std::mutex> lk(g_memlog_m);
+    const auto it = g_memptr.find(p);
+    if (it == g_memptr.end()) return;
+    MemRow& r = g_memrows[it->second.first];
+    r.bytes -= it->second.second, --r.n;
+    g_memptr.erase(it);
+}
+cudaError_t dfree(void* p) {
+    memlog_free(p);
+    return cudaFree(p);
+}
+size_t proc_kb(const char* file, const char* key) {   // a "key: N kB" line of /proc/meminfo or /proc/self/status, bytes
+    FILE* f = std::fopen(file, "r");
+    if (!f) return 0;
+    char ln[256];
+    size_t v = 0;
+    const size_t kl = std::strlen(key);
+    while (std::fgets(ln, sizeof ln, f))
+        if (!std::strncmp(ln, key, kl) && ln[kl] == ':') {
+            v = (size_t) std::strtoull(ln + kl + 1, nullptr, 10) << 10;
+            break;
+        }
+    std::fclose(f);
+    return v;
+}
+size_t gtt_used() {   // the amdgpu GTT pool in use, every process (0: no such file)
+    static std::string path = [] {
+        for (int i = 0; i < 8; ++i) {
+            const std::string p = "/sys/class/drm/card" + std::to_string(i) + "/device/mem_info_gtt_used";
+            if (FILE* f = std::fopen(p.c_str(), "r")) return std::fclose(f), p;
+        }
+        return std::string();
+    }();
+    if (path.empty()) return 0;
+    FILE* f = std::fopen(path.c_str(), "r");
+    unsigned long long v = 0;
+    if (f) {
+        if (std::fscanf(f, "%llu", &v) != 1) v = 0;
+        std::fclose(f);
+    }
+    return (size_t) v;
+}
+void memlog_point(const char* when) {
+    if (!g_memlog) return;
+    size_t fr = 0, tot = 0;
+    if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) cudaGetLastError();
+    const double G = 1073741824.0, Mi = 1048576.0;
+    std::vector<std::pair<size_t, std::pair<std::string, int>>> rows;
+    size_t dev = 0, pin = 0, res = 0;
+    for (const auto& [k, r] : g_memrows) {
+        if (!r.bytes) continue;
+        rows.push_back({r.bytes, k});
+        if (k.first == "work-vmm" && g_arena_released) continue;   // (IK2_MEMTRIM 0x04: unmapped while idle)
+        if (k.first == "pinned" || k.first == "kv-cells") pin += r.bytes;
+        else if (k.first == "kv-reserved") res += r.bytes;
+        else dev += r.bytes;
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::fprintf(stderr, "memlog %s: cudaMemGetInfo used %.3f GiB of %.3f; VmRSS %.3f GiB; MemAvailable %.3f GiB; GTT used "
+                 "(all processes) %.3f GiB\n", when, (tot - fr) / G, tot / G, proc_kb("/proc/self/status", "VmRSS") / G,
+                 proc_kb("/proc/meminfo", "MemAvailable") / G, gtt_used() / G);
+    size_t run = 0;
+    for (const auto& [b, k] : rows) {
+        if (k.first != "kv-reserved") run += b;
+        std::fprintf(stderr, "memlog %s   %-11s ik2_main.cu:%-5d x%-5ld %10.1f MiB  running %9.1f MiB\n", when,
+                     k.first.c_str(), k.second, g_memrows[k].n, b / Mi, run / Mi);
+    }
+    std::fprintf(stderr, "memlog %s: logged device %.3f GiB, pinned / cells %.3f GiB (reserved, not backed: %.3f GiB); "
+                 "cudaMemGetInfo used - logged device = %.3f GiB (the runtime: context, code objects, hipBLAS, scratch, "
+                 "graphs)\n", when, dev / G, pin / G, res / G, ((double) (tot - fr) - (double) dev) / G);
+}
+// the memory guard of a growth (KV): MemAvailable after >= IK2_MEM_FLOOR_MIB (512), GTT used after <= IK2_GTT_CAP_MIB
+// (23,040 = 22.5 GiB: a 10-26 panic came near 23)
+bool mem_room(size_t add, const char* what) {
+    static const size_t floor_b = (size_t) (getenv("IK2_MEM_FLOOR_MIB") ? atoll(getenv("IK2_MEM_FLOOR_MIB")) : 512) << 20;
+    static const size_t cap_b = (size_t) (getenv("IK2_GTT_CAP_MIB") ? atoll(getenv("IK2_GTT_CAP_MIB")) : 23040) << 20;
+    const size_t avail = proc_kb("/proc/meminfo", "MemAvailable"), gtt = gtt_used();
+    if ((avail && avail < add + floor_b) || (gtt && gtt + add > cap_b)) {
+        std::fprintf(stderr, "memtrim: %s of %.1f MiB refused: MemAvailable %.2f GiB (floor %.2f), GTT used %.2f GiB "
+                     "(cap %.2f)\n", what, add / 1048576.0, avail / 1073741824.0, floor_b / 1073741824.0,
+                     gtt / 1073741824.0, cap_b / 1073741824.0);
+        return false;
+    }
+    return true;
+}
+
+// Memory that comes and goes at fixed addresses (IK2_MEMTRIM 0x02, 0x04).
+// VMM on ROCm 7.2.4 / gfx1151: the first hipMemMap into a
+// hipMemAddressReserve range works anywhere in it, a second map into the same range fails 'invalid argument' (18 MiB
+// at +38 MiB, 4 MiB at +6 MiB) - the runtime takes the reserved range's object for the first mapping, so the rest
+// of the range is not found again.  A map at the start of its own reservation, unmapped and mapped again at the
+// same address, works (the load probe's rounds; the day run's idle release + restore).  So here every map is the
+// one map of its own reservation: a K / V array = consecutive chunk reservations (each asked at the address after
+// the one before - hipMemAddressReserve's addr - and checked, at load), a work buffer = one reservation.  Else, for
+// K / V only, 2 MiB host cells registered in order (as gufo's GUFO_DEV_MEMTRIM_9: one MAP_NORESERVE
+// mapping aligned to a cell, the device address the host one - checked; a cell is never unregistered: the runtime
+// keeps an old registration and a later register at that address takes no memory).
+constexpr size_t kCell = (size_t) 2 << 20;
+size_t g_vmm_gran = 0;    // 0: not probed yet; SIZE_MAX: refused
+size_t g_vmm_chunk = 0;   // a K / V chunk: 2 MiB rounded up to the recommended and the minimum granularity
+hipMemAllocationProp vmm_prop() {
+    hipMemAllocationProp p{};
+    int d = 0;
+    CU(cudaGetDevice(&d));
+    p.type = hipMemAllocationTypePinned, p.location.type = cudaMemLocationTypeDevice, p.location.id = d;
+    return p;
+}
+cudaError_t vmm_map(uint8_t* at, size_t bytes, hipMemGenericAllocationHandle_t& h) {   // (at: a reservation's start)
+    const hipMemAllocationProp prop = vmm_prop();
+    cudaError_t e = hipMemCreate(&h, bytes, &prop, 0);
+    if (e != cudaSuccess) return e;
+    e = hipMemMap(at, bytes, 0, h, 0);
+    if (e == cudaSuccess) {
+        hipMemAccessDesc a{};
+        a.location = prop.location, a.flags = hipMemAccessFlagsProtReadWrite;
+        e = hipMemSetAccess(at, bytes, &a, 1);
+        if (e != cudaSuccess) (void) hipMemUnmap(at, bytes);
+    }
+    if (e != cudaSuccess) (void) hipMemRelease(h);
+    return e;
+}
+// n chunk reservations back to back from one free range (reserved, freed, then asked chunk by chunk at its
+// addresses); false (nothing kept) if the runtime puts one elsewhere
+bool vmm_reserve_chunks(size_t chunk, size_t n, std::vector<uint8_t*>& out) {
+    out.clear();
+    void* r = nullptr;
+    if (hipMemAddressReserve(&r, chunk * n, chunk, nullptr, 0) != cudaSuccess) return (void) cudaGetLastError(), false;
+    (void) hipMemAddressFree(r, chunk * n);
+    for (size_t i = 0; i < n; ++i) {
+        void* want = (uint8_t*) r + i * chunk, *got = nullptr;
+        if (hipMemAddressReserve(&got, chunk, chunk, want, 0) != cudaSuccess || got != want) {
+            (void) cudaGetLastError();
+            if (got) (void) hipMemAddressFree(got, chunk);
+            for (uint8_t* q : out) (void) hipMemAddressFree(q, chunk);
+            out.clear();
+            return false;
+        }
+        out.push_back((uint8_t*) got);
+    }
+    return true;
+}
+__global__ void vmm_probe_kernel(uint32_t* p, size_t n, uint32_t salt, int check, unsigned* bad) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint32_t v = (uint32_t) i * 2654435761u + salt;
+    if (!check) p[i] = v;
+    else if (p[i] != v) atomicAdd(bad, 1u);
+}
+// a kernel writes 256 KiB across the join of two chunks, another reads it back, then each side is copied back
+cudaError_t vmm_join_check(uint8_t* join, uint32_t salt, unsigned* bad_d) {
+    const size_t n = (256 << 10) / 4;
+    uint32_t* p = (uint32_t*) (join - (128 << 10));
+    unsigned bad = 0;
+    cudaError_t e = cudaMemset(bad_d, 0, 4);
+    if (e == cudaSuccess) {
+        vmm_probe_kernel<<<(unsigned) (n / 256), 256>>>(p, n, salt, 0, bad_d);
+        vmm_probe_kernel<<<(unsigned) (n / 256), 256>>>(p, n, salt, 1, bad_d);
+        e = cudaDeviceSynchronize();
+    }
+    if (e == cudaSuccess) e = cudaMemcpy(&bad, bad_d, 4, cudaMemcpyDeviceToHost);
+    std::vector<uint32_t> h(n / 2);
+    for (int side = 0; side < 2 && e == cudaSuccess && !bad; ++side) {   // (an API copy inside one chunk each)
+        e = cudaMemcpy(h.data(), p + side * (n / 2), n / 2 * 4, cudaMemcpyDeviceToHost);
+        for (size_t i = 0; e == cudaSuccess && i < n / 2; ++i)
+            bad += h[i] != (uint32_t) (i + side * (n / 2)) * 2654435761u + salt;
+    }
+    return e == cudaSuccess && bad ? cudaErrorUnknown : e;
+}
+// Whether the pattern used here works (ROCm calls the VMM API beta): two chunk
+// reservations back to back, a handle mapped at each start, a kernel across the join + copies back, the second
+// chunk unmapped, released and mapped again (the idle release / restore), checked again.  Also printed, not used:
+// whether a second map inside one reservation works.  Refused: one line; K / V then take host cells, the work set
+// cudaMalloc - decided at load, never in a request.
+bool vmm_ok() {
+    if (g_vmm_gran) return g_vmm_gran != SIZE_MAX;
+    g_vmm_gran = SIZE_MAX;
+    const hipMemAllocationProp prop = vmm_prop();
+    int sup = 0;
+    size_t gmin = 0, grec = 0;
+    const char* what = "attribute";
+    cudaError_t e = cudaDeviceGetAttribute(&sup, hipDeviceAttributeVirtualMemoryManagementSupported, prop.location.id);
+    if (e == cudaSuccess && !sup) e = hipErrorNotSupported;
+    if (e == cudaSuccess) what = "granularity", e = hipMemGetAllocationGranularity(&gmin, &prop, hipMemAllocationGranularityMinimum);
+    if (e == cudaSuccess) e = hipMemGetAllocationGranularity(&grec, &prop, hipMemAllocationGranularityRecommended);
+    if (e == cudaSuccess && (!gmin || !grec)) e = hipErrorInvalidValue;
+    const size_t chunk = e == cudaSuccess ? (std::max(kCell, grec) + gmin - 1) / gmin * gmin : 0;
+    std::vector<uint8_t*> rs;
+    hipMemGenericAllocationHandle_t h[2] = {};
+    bool mapped[2] = {false, false};
+    unsigned* bad_d = nullptr;
+    if (e == cudaSuccess) what = "scratch", e = cudaMalloc(&bad_d, 4);
+    if (e == cudaSuccess && !vmm_reserve_chunks(chunk, 2, rs)) what = "back-to-back reservations", e = hipErrorInvalidValue;
+    for (int i = 0; i < 2 && e == cudaSuccess; ++i) what = "map", e = vmm_map(rs[i], chunk, h[i]), mapped[i] = e == cudaSuccess;
+    if (e == cudaSuccess) what = "kernel + copies across the join", e = vmm_join_check(rs[1], 0x1234u, bad_d);
+    if (e == cudaSuccess) {
+        what = "unmap / release / map again";
+        e = hipMemUnmap(rs[1], chunk);
+        mapped[1] = false;
+        if (e == cudaSuccess) e = hipMemRelease(h[1]);
+        if (e == cudaSuccess) e = vmm_map(rs[1], chunk, h[1]), mapped[1] = e == cudaSuccess;
+        if (e == cudaSuccess) what = "kernel + copies after the re-map", e = vmm_join_check(rs[1], 0x9876u, bad_d);
+    }
+    for (int i = 0; i < 2; ++i)
+        if (mapped[i]) (void) hipMemUnmap(rs[i], chunk), (void) hipMemRelease(h[i]);
+    for (uint8_t* q : rs) (void) hipMemAddressFree(q, chunk);
+    cudaError_t second = hipErrorNotSupported;   // (the day run's pattern, for the record)
+    if (e == cudaSuccess) {
+        void* r = nullptr;
+        hipMemGenericAllocationHandle_t a{}, b{};
+        if (hipMemAddressReserve(&r, 2 * chunk, chunk, nullptr, 0) == cudaSuccess) {
+            if (vmm_map((uint8_t*) r, chunk, a) == cudaSuccess) {
+                second = vmm_map((uint8_t*) r + chunk, chunk, b);
+                if (second == cudaSuccess) (void) hipMemUnmap((uint8_t*) r + chunk, chunk), (void) hipMemRelease(b);
+                (void) hipMemUnmap(r, chunk), (void) hipMemRelease(a);
+            }
+            (void) hipMemAddressFree(r, 2 * chunk);
+        }
+        (void) cudaGetLastError();
+    }
+    if (bad_d) (void) cudaFree(bad_d);
+    std::fprintf(stderr, "memtrim: VMM granularity minimum %zu, recommended %zu B; chunk %zu B; a second map inside one "
+                 "reservation: %s\n", gmin, grec, chunk, cudaGetErrorString(second));
+    if (e != cudaSuccess) {
+        (void) cudaGetLastError();
+        std::fprintf(stderr, "memtrim: VMM refused at %s (%s): K / V in host cells, the work set in cudaMalloc\n", what,
+                     cudaGetErrorString(e));
+        return false;
+    }
+    g_vmm_gran = gmin, g_vmm_chunk = chunk;
+    return true;
+}
+struct Backed {   // a K / V array: VMM chunk reservations, or one mapping of host cells
+    uint8_t* base = nullptr;
+    size_t reserved = 0, backed = 0, chunk = kCell;
+    bool cells = false;
+    void* mapping = nullptr;              // (cells: the whole mapping, base rounded up to a cell in it)
+    std::vector<uint8_t*> res;            // (VMM: the chunks' reservations, back to back from base)
+    std::vector<hipMemGenericAllocationHandle_t> h;   // (VMM: the chunks mapped so far, in order)
+};
+bool backed_reserve(Backed& b, size_t bytes, bool cells) {
+    b.cells = cells;
+    if (!cells) {
+        if (!vmm_ok()) return false;
+        b.chunk = g_vmm_chunk;
+        const size_t n = (bytes + b.chunk - 1) / b.chunk;
+        if (!vmm_reserve_chunks(b.chunk, n, b.res)) return false;
+        b.base = b.res[0], b.reserved = n * b.chunk;
+        return true;
+    }
+#ifndef _WIN32
+    b.reserved = (bytes + kCell - 1) / kCell * kCell;
+    void* m = ::mmap(nullptr, b.reserved + kCell, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (m == MAP_FAILED) return false;
+    ::madvise(m, b.reserved + kCell, MADV_DONTFORK);   // (registered pages must not turn copy-on-write in a fork)
+    b.mapping = m;
+    b.base = (uint8_t*) (((uintptr_t) m + kCell - 1) / kCell * kCell);
+    return true;
+#else
+    return false;
+#endif
+}
+// backs [backed, to) rounded up to a chunk (a cell), at most the reservation: one handle a VMM chunk, 2 MiB cells
+bool backed_grow(Backed& b, size_t to) {
+    to = std::min(b.reserved, (to + b.chunk - 1) / b.chunk * b.chunk);
+    while (b.backed < to) {
+        uint8_t* at = b.base + b.backed;
+        cudaError_t e;
+        if (b.cells) {
+            void* dp = nullptr;
+            e = cudaHostRegister(at, kCell, hipHostRegisterDefault);
+            if (e == cudaSuccess) {
+                e = cudaHostGetDevicePointer(&dp, at, 0);
+                if (e == cudaSuccess && dp != at) e = hipErrorInvalidDevicePointer;
+                if (e != cudaSuccess) (void) cudaHostUnregister(at);
+            }
+        } else {
+            hipMemGenericAllocationHandle_t hh{};
+            e = vmm_map(at, b.chunk, hh);   // (at = the start of chunk backed / chunk's own reservation)
+            if (e == cudaSuccess) b.h.push_back(hh);
+        }
+        if (e != cudaSuccess) {
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "memtrim: backing %.1f MiB at +%.1f MiB of a %.1f MiB range failed (%s): %s\n",
+                         b.chunk / 1048576.0, b.backed / 1048576.0, b.reserved / 1048576.0, b.cells ? "cells" : "VMM",
+                         cudaGetErrorString(e));
+            return false;
+        }
+        b.backed += b.chunk;
+    }
+    return true;
+}
+
+// IK2_MEMTRIM 0x04: the work set, a reservation + one handle a buffer (mapped at its start, zeroed); work_release()
+// unmaps and releases every handle, work_restore() maps new ones at the same addresses
+struct ArenaBuf {
+    uint8_t* p;
+    size_t bytes;
+    hipMemGenericAllocationHandle_t h;
+};
+std::vector<ArenaBuf> g_arena;
+template <class T> T* arena_alloc(size_t count, int line) {
+    if (g_arena_off) return nullptr;
+    if (!vmm_ok()) {
+        g_arena_off = true;
+        std::fprintf(stderr, "memtrim 0x04: no VMM: the work set in cudaMalloc (no idle release)\n");
+        return nullptr;
+    }
+    if (count * sizeof(T) < ((size_t) 1 << 20)) return nullptr;   // (a small buffer: cudaMalloc, kept - ~5 MiB in all)
+    // (whole chunks: the sizes the load probe mapped; <= 2 MiB a buffer of rounding while mapped)
+    const size_t bytes = (count * sizeof(T) + g_vmm_chunk - 1) / g_vmm_chunk * g_vmm_chunk;
+    void* r = nullptr;
+    hipMemGenericAllocationHandle_t h{};
+    cudaError_t e = hipMemAddressReserve(&r, bytes, g_vmm_chunk, nullptr, 0);
+    if (e == cudaSuccess) {
+        e = vmm_map((uint8_t*) r, bytes, h);
+        if (e != cudaSuccess) (void) hipMemAddressFree(r, bytes);
+    }
+    if (e != cudaSuccess) {
+        (void) cudaGetLastError();
+        g_arena_off = true;
+        std::fprintf(stderr, "memtrim 0x04: a VMM buffer of %.1f MiB refused (%s): this and the rest in cudaMalloc\n",
+                     bytes / 1048576.0, cudaGetErrorString(e));
+        return nullptr;
+    }
+    CU(cudaMemset(r, 0, bytes));
+    g_arena.push_back({(uint8_t*) r, bytes, h});
+    memlog_add("work-vmm", r, bytes, line);
+    return (T*) r;
+}
+void work_release() {
+    if (g_arena.empty() || g_arena_released) return;
+    const double t0 = now();
+    size_t was = 0;
+    CU(cudaDeviceSynchronize());
+    for (auto& a : g_arena) {
+        CU(hipMemUnmap(a.p, a.bytes));
+        CU(hipMemRelease(a.h));
+        was += a.bytes;
+    }
+    g_arena_released = true;
+    std::fprintf(stderr, "memtrim 0x04: work set released (%.1f MiB, %zu buffers) in %.1f ms; GTT used %.3f GiB\n",
+                 was / 1048576.0, g_arena.size(), (now() - t0) * 1e3, gtt_used() / 1073741824.0);
+}
+void work_restore() {
+    if (!g_arena_released) return;
+    const double t0 = now();
+    size_t want = 0;
+    for (const auto& a : g_arena) want += a.bytes;
+    mem_room(want, "work set restore (proceeding)");
+    for (auto& a : g_arena) {
+        const cudaError_t e = vmm_map(a.p, a.bytes, a.h);
+        if (e != cudaSuccess) die(std::string("memtrim 0x04: the work set could not be mapped back: ") + cudaGetErrorString(e));
+        CU(cudaMemsetAsync(a.p, 0, a.bytes, g_s));
+    }
+    CU(cudaStreamSynchronize(g_s));
+    g_arena_released = false;
+    std::fprintf(stderr, "memtrim 0x04: work set mapped back (%.1f MiB, %zu buffers) in %.1f ms\n", want / 1048576.0,
+                 g_arena.size(), (now() - t0) * 1e3);
+}
+
+template <class T>
+T* dalloc_k(size_t n, const char* kind, int line) {
+    T* p = nullptr;
+    CU(cudaMalloc(&p, std::max<size_t>(1, n) * sizeof(T)));
+    memlog_add(kind, p, std::max<size_t>(1, n) * sizeof(T), line);
+    return p;
+}
+template <class T>
+T* dalloc(size_t n, std::source_location sl = std::source_location::current()) {
+    return dalloc_k<T>(n, "device", (int) sl.line());
+}
+// pinned host memory (hipHostAlloc as before), logged
+template <class T>
+cudaError_t halloc(T** p, size_t n, unsigned flags, std::source_location sl = std::source_location::current()) {
+    const cudaError_t e = hipHostAlloc((void**) p, n, flags);
+    if (e == cudaSuccess) memlog_add("pinned", *p, n, (int) sl.line());
+    return e;
+}
+#else
 template <class T>
 T* dalloc(size_t n) {
     T* p = nullptr;
     CU(cudaMalloc(&p, std::max<size_t>(1, n) * sizeof(T)));
     return p;
 }
+#endif  // STRATA_USE_HIP
 
 // Y [T][N] (ldy) = X [T][K] FP16 . W [N][K]^T FP16, F32 sums
 void gemm16(const uint16_t* W, int N, int Kd, const uint16_t* X, int T, float* Y, int ldy, float beta = 0.0f) {
@@ -449,11 +862,22 @@ std::vector<PrefillTail> prefill_tails;
 size_t parked_bytes = 0;
 bool tails_parked = false;
 
+#if defined(STRATA_USE_HIP)
+template <class T> T* work_alloc(size_t count, size_t hot_bytes = 2ULL << 20,
+                                 std::source_location sl = std::source_location::current()) {
+    const size_t n = count * sizeof(T);
+    if (g_memtrim & 4)
+        if (T* p = arena_alloc<T>(count, (int) sl.line())) return p;
+    if (!g_managed_experts || !(getenv("IK2_PARK_WORK") && atoi(getenv("IK2_PARK_WORK"))) ||
+        n <= hot_bytes + (2ULL << 20))
+        return dalloc_k<T>(count, "work", (int) sl.line());
+#else
 template <class T> T* work_alloc(size_t count, size_t hot_bytes = 2ULL << 20) {
     const size_t n = count * sizeof(T);
     if (!g_managed_experts || !(getenv("IK2_PARK_WORK") && atoi(getenv("IK2_PARK_WORK"))) ||
         n <= hot_bytes + (2ULL << 20))
         return dalloc<T>(count);
+#endif  // STRATA_USE_HIP
     T* p = nullptr;
     CU(cudaMallocManaged(&p, n));
     CU(cudaMemPrefetchAsync(p, n, 0, g_s));
@@ -472,8 +896,72 @@ void place_tails(bool host) {
     std::fprintf(stderr, "scratch tails: %.3f GiB moved to %s\n", double(parked_bytes) / (1ULL << 30),
                  host ? "host" : "GPU");
 }
+#if defined(STRATA_USE_HIP)
+// IK2_MEMTRIM 0x02: a full layer's K or V array [ctx][row] reserved at its size, backed as the context grows
+// (kv_ensure); every reader stops at its last written row, no API copy touches it (IK2_KV_MANAGED excepted: left alone)
+struct KvRegion {
+    Backed b;
+    size_t row_bytes = 0;
+};
+std::vector<KvRegion> g_kv_regions;
+int g_kv_ctx = 0;                     // a full layer's rows (--ctx)
+int g_kv_rows = 1 << 30;              // rows every array has backed, less the margin (no reservation: all)
+constexpr int kKvMargin = 64;         // rows backed past the ask: a tile's over-read lands in memory, not a fault
+template <class T> T* kv_reserve(size_t n, int line) {
+    const size_t bytes = n * sizeof(T);
+    if (g_kv_ctx <= 0 || !bytes || bytes % (size_t) g_kv_ctx) return nullptr;
+    KvRegion r;
+    static bool cells = (g_memtrim & 0x20) || !vmm_ok();   // (one backing for every array, chosen at load)
+    if (!cells && !backed_reserve(r.b, bytes, false)) {
+        if (!g_kv_regions.empty())   // (an array already in VMM chunks: this one would not match - the old way)
+            return std::fprintf(stderr, "memtrim 0x02: a K / V array's chunk reservations refused: cudaMalloc\n"), nullptr;
+        std::fprintf(stderr, "memtrim 0x02: K / V chunk reservations refused: host cells\n");
+        cells = true, r = KvRegion{};
+    }
+    if (cells && !backed_reserve(r.b, bytes, true)) {
+        std::fprintf(stderr, "memtrim 0x02: no cell reservation for a K / V array: cudaMalloc as before\n");
+        return nullptr;
+    }
+    r.row_bytes = bytes / (size_t) g_kv_ctx;
+    memlog_add("kv-reserved", r.b.base, bytes, line);
+    g_kv_regions.push_back(r);
+    g_kv_rows = 0;
+    return (T*) r.b.base;
+}
+// rows [0, rows) of every reserved array backed (+ the margin, a step at a time); false: the memory guard or the
+// runtime refused (nothing written past the backed rows: the caller stops the request)
+bool kv_ensure(int rows) {
+    if (rows <= g_kv_rows || g_kv_regions.empty()) return true;
+    const size_t want = std::min<size_t>((size_t) g_kv_ctx, (size_t) rows + kKvMargin);
+    const bool cells = g_kv_regions[0].b.cells;
+    size_t add = 0, tot = 0;
+    for (const auto& r : g_kv_regions) {
+        const size_t to = std::min(r.b.reserved, (want * r.row_bytes + r.b.chunk - 1) / r.b.chunk * r.b.chunk);
+        add += to > r.b.backed ? to - r.b.backed : 0;
+    }
+    if (add && !mem_room(add, "K / V growth")) return false;
+    const double t0 = now();
+    for (auto& r : g_kv_regions)
+        if (!backed_grow(r.b, want * r.row_bytes)) return false;
+    int have = g_kv_ctx;
+    for (const auto& r : g_kv_regions) {
+        tot += r.b.backed;
+        if (r.b.backed < r.b.reserved) have = std::min(have, (int) (r.b.backed / r.row_bytes) - kKvMargin);
+    }
+    g_kv_rows = have;
+    if (g_memlog) g_memrows[{cells ? "kv-cells" : "kv-vmm", 0}].bytes = tot, g_memrows[{cells ? "kv-cells" : "kv-vmm", 0}].n = 1;
+    std::fprintf(stderr, "memtrim 0x02: K / V backed for %d rows (+%.1f MiB; %.1f MiB in %zu arrays, %s) in %.2f ms\n",
+                 have, add / 1048576.0, tot / 1048576.0, g_kv_regions.size(), cells ? "cells" : "VMM", (now() - t0) * 1e3);
+    return true;
+}
+template <class T> T* kv_alloc(size_t n, bool sliding, std::source_location sl = std::source_location::current()) {
+    if (!sliding && !g_kv_managed && (g_memtrim & 2))
+        if (T* p = kv_reserve<T>(n, (int) sl.line())) return p;
+    if (sliding || !g_kv_managed) return dalloc_k<T>(n, "kv", (int) sl.line());
+#else
 template <class T> T* kv_alloc(size_t n, bool sliding) {
     if (sliding || !g_kv_managed) return dalloc<T>(n);
+#endif  // STRATA_USE_HIP
     T* ptr = nullptr;
     CU(cudaMallocManaged(&ptr, n * sizeof(T)));
     return ptr;
@@ -527,7 +1015,11 @@ Mat load_mat(const Shards& S, const std::string& n, int N, int Kd) {
         return m;
     }
     if (nb > g_stage_bytes) {
+#if defined(STRATA_USE_HIP)
+        if (g_stage) dfree(g_stage);
+#else
         if (g_stage) cudaFree(g_stage);
+#endif  // STRATA_USE_HIP
         g_stage = dalloc<uint8_t>(g_stage_bytes = nb);
     }
     CU(cudaMemcpy(g_stage, S.data(n), nb, cudaMemcpyHostToDevice));
@@ -601,7 +1093,11 @@ struct MatPart {
 
 void ensure_stage(size_t nb) {
     if (nb > g_stage_bytes) {
+#if defined(STRATA_USE_HIP)
+        if (g_stage) dfree(g_stage);
+#else
         if (g_stage) cudaFree(g_stage);
+#endif  // STRATA_USE_HIP
         g_stage = dalloc<uint8_t>(g_stage_bytes = nb);
     }
 }
@@ -1334,11 +1830,13 @@ struct ExpertCache {
             for (int i = 0; i < kBounce; ++i) {
                 if (bounce[i]) {
                     if (bounce_used[i]) CU(cudaEventSynchronize(bounce_ev[i]));
+                    memlog_free(bounce[i]);
                     CU(hipHostFree(bounce[i]));
                 } else {
                     CU(cudaEventCreateWithFlags(&bounce_ev[i], cudaEventDisableTiming));
                 }
                 CU(cudaHostAlloc((void**) &bounce[i], need, hipHostMallocDefault));
+                memlog_add("pinned", bounce[i], need, __LINE__);
                 bounce_used[i] = false;
             }
             bounce_cap = need;
@@ -1355,6 +1853,19 @@ struct ExpertCache {
         CU(cudaEventRecord(bounce_ev[i], st));
         bounce_used[i] = true;
         bytes_up += off;
+    }
+    // IK2_MEMTRIM 0x01: the ring freed once the resident load has copied every expert (copy_in makes it again if a
+    // miss ever comes)
+    void free_bounce() {
+        for (int i = 0; i < kBounce; ++i) {
+            if (!bounce[i]) continue;
+            if (bounce_used[i]) CU(cudaEventSynchronize(bounce_ev[i]));
+            memlog_free(bounce[i]);
+            CU(hipHostFree(bounce[i]));
+            CU(cudaEventDestroy(bounce_ev[i]));
+            bounce[i] = nullptr, bounce_ev[i] = nullptr, bounce_used[i] = false;
+        }
+        bounce_cap = 0, bounce_next = 0;
     }
     static constexpr int kBounce = 4;   // (4 x one expert's bytes, <= 4 x 8.1 MiB pinned)
     uint8_t* bounce[kBounce] = {};
@@ -1554,7 +2065,11 @@ Work& dev_work(int d) { return g_dev[d].W; }
 ExpertCache& dev_cache(int d) { return g_dev[d].EC; }
 void use_dev(int d) {
     if (d == g_cur) return;
+#if defined(STRATA_USE_HIP)
+    if (g_stage) dfree(g_stage), g_stage = nullptr, g_stage_bytes = 0;   // (the previous device's)
+#else
     if (g_stage) cudaFree(g_stage), g_stage = nullptr, g_stage_bytes = 0;   // (the previous device's)
+#endif  // STRATA_USE_HIP
     CU(cudaSetDevice(d));
     g_cur = d;
     g_s = g_dev[d].s, g_cs = g_dev[d].cs, g_ev = g_dev[d].ev, g_blas = g_dev[d].blas;
@@ -2593,11 +3108,19 @@ void prepare_host_experts(Model& model, size_t bytes_needed, int depth) {
     if (active == host_plan.active) return;
     auto& buffers = host_plan.buffers;
     if (placed && !buffers.picks) {
+#if defined(STRATA_USE_HIP)
+        CU(halloc(&buffers.picks, c.K * sizeof(int), hipHostMallocPortable));
+        CU(halloc(&buffers.input, c.C * sizeof(float), hipHostMallocPortable));
+        CU(halloc(&buffers.gate_up, c.K * 2 * c.F * sizeof(float), hipHostMallocPortable));
+        CU(halloc(&buffers.hidden, c.K * c.F * sizeof(uint16_t), hipHostMallocPortable));
+        CU(halloc(&buffers.output, c.K * c.C * sizeof(float), hipHostMallocPortable));
+#else
         CU(cudaHostAlloc(&buffers.picks, c.K * sizeof(int), cudaHostAllocPortable));
         CU(cudaHostAlloc(&buffers.input, c.C * sizeof(float), cudaHostAllocPortable));
         CU(cudaHostAlloc(&buffers.gate_up, c.K * 2 * c.F * sizeof(float), cudaHostAllocPortable));
         CU(cudaHostAlloc(&buffers.hidden, c.K * c.F * sizeof(uint16_t), cudaHostAllocPortable));
         CU(cudaHostAlloc(&buffers.output, c.K * c.C * sizeof(float), cudaHostAllocPortable));
+#endif  // STRATA_USE_HIP
         host_plan.packed.resize(c.n_layer);
     }
     const double start = now();
@@ -3205,12 +3728,19 @@ void block_init(Model& M) {
     if (g_blk.ready) return;
     const Config& c = M.c;
     const int C = c.C, KD = c.KV * c.D, S = kBlockMax * c.K;
+#if defined(STRATA_USE_HIP)
+    CU(halloc(&g_blk.emb_h, (size_t) kBlockMax * C * 4, hipHostMallocPortable));
+    CU(halloc(&g_blk.pos_h, (size_t) kBlockMax * 4, hipHostMallocPortable));
+    CU(halloc(&g_blk.logits_h, (size_t) kBlockMax * c.n_vocab * 4, hipHostMallocPortable));
+    CU(halloc(&g_blk.cand_h, (size_t) kBlockMax * (2 + 2 * kCandCap) * 4, hipHostMallocPortable));
+#else
     CU(cudaHostAlloc(&g_blk.emb_h, (size_t) kBlockMax * C * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&g_blk.pos_h, (size_t) kBlockMax * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&g_blk.slot_ids_h, (size_t) kMaxParallel * 4, cudaHostAllocPortable));
     g_blk.slot_ids_d = dalloc<int>(kMaxParallel);
     CU(cudaHostAlloc(&g_blk.logits_h, (size_t) kBlockMax * c.n_vocab * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&g_blk.cand_h, (size_t) kBlockMax * (2 + 2 * kCandCap) * 4, cudaHostAllocPortable));
+#endif  // STRATA_USE_HIP
     g_blk.cand_d = dalloc<int>((size_t) kBlockMax * (2 + 2 * kCandCap));
     g_blk.blob = dalloc<const uint8_t*>(S);
     g_blk.n = dalloc<int>(S), g_blk.inv = dalloc<int>(S);
@@ -3453,6 +3983,9 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 
 // [T][n_vocab] appended (kLogits).  The convs' records then hold the window (block_rollback takes it back).
 void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std::vector<float>& logits_out,
                 std::vector<int>* argmax_out, int slot = 0) {
+#if defined(STRATA_USE_HIP)
+    if (!kv_ensure(pos0 + T)) die("memtrim 0x02: the K / V rows up to " + std::to_string(pos0 + T) + " cannot be backed");
+#endif  // STRATA_USE_HIP
     const Config& c = M.c;
     if (T < 1 || T > kBlockMax) die("fast_block: a window of 1 .. 8 tokens");
     if (!g_blk.ready) block_init(M);
@@ -3917,6 +4450,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
              std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp, int slot = 0) {
 #if defined(STRATA_USE_HIP)
     k::enable_grouped_tensor_products(false);   // HIP: the grouped tensor-core products are compiled out
+    if (!kv_ensure(pos0 + T))   // (IK2_MEMTRIM 0x02; the callers that can stop a request asked first: never a GPU fault)
+        die("memtrim 0x02: the K / V rows up to " + std::to_string(pos0 + T) + " cannot be backed");
 #else
     k::enable_grouped_tensor_products(allow_short_batch_products());
 #endif  // STRATA_USE_HIP
@@ -4735,6 +5270,9 @@ void big_end(Work& W, ExpertCache& EC, BigScratch& bs) {
 // Sweeps each layer once across up to W.T_sup tokens (sub-chunked attention for KV/attention scratch, then one combined MoE pass).
 void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chunk, OutMode out_mode,
                          std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp, int slot = 0) {
+#if defined(STRATA_USE_HIP)
+    if (!kv_ensure(pos0 + T)) die("memtrim 0x02: the K / V rows up to " + std::to_string(pos0 + T) + " cannot be backed");
+#endif  // STRATA_USE_HIP
     const Config& c = M.c;
     const int C = c.C;
     use_dev(M.L[0].dev);
@@ -5129,8 +5667,15 @@ int main(int argc, char** argv) {
     }
 #if defined(STRATA_USE_HIP)
     const bool amd_tuned = amd_tuned_device(n_gpu);
-#endif  // STRATA_USE_HIP
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
+    // (gfx1151: 0x17 - the bounce ring freed, K / V backed as the context grows, the idle work set released, the
+    // snapshot buffers not zero-filled)
+    g_memtrim = getenv("IK2_MEMTRIM") ? (int) std::strtol(getenv("IK2_MEMTRIM"), nullptr, 0) : amd_tuned ? 0x17 : 0;
+    g_memlog = getenv("IK2_MEMLOG") && std::atoi(getenv("IK2_MEMLOG"));
+    if (g_memtrim) std::printf("IK2_MEMTRIM 0x%x\n", g_memtrim);
+#else
+    g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
+#endif  // STRATA_USE_HIP
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
     g_mv = !getenv("IK2_MV") || std::atoi(getenv("IK2_MV"));
     g_group = !getenv("IK2_GROUP") || std::atoi(getenv("IK2_GROUP"));
@@ -5299,6 +5844,9 @@ int main(int argc, char** argv) {
     use_dev(0);
     g_overlap = !getenv("IK2_OVERLAP") || std::atoi(getenv("IK2_OVERLAP"));
     for (auto& e : g_ring) CU(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+#if defined(STRATA_USE_HIP)
+    memlog_point("runtime up (streams, events, hipBLAS handles)");
+#endif  // STRATA_USE_HIP
     // (off by default: on an RTX PRO 6000 node's Xeon 6737P an NVFP4 expert takes 0.73 ms on 7 threads against 0.33 ms
     //  over PCIe, and the lane measured 16.4 against 16.8 tok/s - IK2_CPU=1 to try it)
     if (getenv("IK2_CPU") && std::atoi(getenv("IK2_CPU")) && ik2::cpu::available() && threads > 1 && n_gpu == 1)
@@ -5376,7 +5924,12 @@ int main(int argc, char** argv) {
         for (int l = 0; l < c.n_layer; ++l) {
             const size_t cap = c.sliding[l] ? (size_t) std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : global_cap;
             const size_t mult = c.sliding[l] ? (size_t) g_parallel : 1;
+#if defined(STRATA_USE_HIP)
+            const bool grown = (g_memtrim & 2) && !g_kv_managed && !c.sliding[l];   // (backed as the context grows)
+            if ((!g_kv_managed || c.sliding[l]) && !grown)
+#else
             if (!g_kv_managed || c.sliding[l])
+#endif  // STRATA_USE_HIP
                 kv_b += mult * (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
         }
         size_t fr0 = 0, tot0 = 0;
@@ -5663,6 +6216,9 @@ int main(int argc, char** argv) {
         g_kv_pt_d = dalloc<int>((size_t) g_parallel * g_kv_max_pages);
         CU(cudaMemset(g_kv_pt_d, 0, (size_t) g_parallel * g_kv_max_pages * sizeof(int)));
     }
+#if defined(STRATA_USE_HIP)
+    g_kv_ctx = ctx;
+#endif  // STRATA_USE_HIP
     M.V.resize(c.n_visit);
     for (int v = 0; v < c.n_visit; ++v) {
         Visit& Vi = M.V[v];
@@ -5690,14 +6246,23 @@ int main(int argc, char** argv) {
     M.out_w = load_mat(S, "output.weight", c.n_rows, (int) C);
     if (g_dense_q8) {   // (a layer's largest; the head's logits go a token at a time over its blocks)
         g_w16_n = (2 * HD + 2 * KD + (size_t) c.H * c.d_rel) * C;
+#if defined(STRATA_USE_HIP)
+        if (g_memtrim & 4) g_w16 = arena_alloc<uint16_t>(g_w16_n, __LINE__);
+        if (!g_w16) g_w16 = dalloc<uint16_t>(g_w16_n);
+#else
         g_w16 = dalloc<uint16_t>(g_w16_n);
+#endif  // STRATA_USE_HIP
     }
     M.out_norm = load_f32(S, "output_norm.weight", C);
     M.out_res_score = load_f32(S, rw ? "output_res_query.weight" : "output_res_score.weight", C);
     M.embd = S.data("token_embd.weight");
     M.embd_type = (int) S.info("token_embd.weight")->type;
     if (!k::block_values(M.embd_type)) die("token_embd's type");
+#if defined(STRATA_USE_HIP)
+    if (g_stage) dfree(g_stage), g_stage = nullptr, g_stage_bytes = 0;
+#else
     if (g_stage) cudaFree(g_stage), g_stage = nullptr, g_stage_bytes = 0;
+#endif  // STRATA_USE_HIP
     {
         size_t kv_bytes = 0;
         for (const auto& Vi : M.V) {
@@ -5711,6 +6276,14 @@ int main(int argc, char** argv) {
         else
             std::printf("kv cache: %s (%.2f GiB across %d layer%s)\n", g_kv_fp8 ? "FP8 E4M3" : "FP16",
                         kv_bytes / 1073741824.0, c.n_visit, c.n_pass > 1 ? " visits" : "s");
+#if defined(STRATA_USE_HIP)
+        if (!g_kv_regions.empty()) {
+            size_t r = 0;
+            for (const auto& k : g_kv_regions) r += k.b.reserved;
+            std::printf("kv cache: the full layers' %zu arrays (%.2f GiB) reserved, backed as the context grows (%s)\n",
+                        g_kv_regions.size(), r / 1073741824.0, g_kv_regions[0].b.cells ? "2 MiB host cells" : "VMM");
+        }
+#endif  // STRATA_USE_HIP
         std::fflush(stdout);
     }
     size_t fr = 0, tot = 0;
@@ -5721,6 +6294,9 @@ int main(int argc, char** argv) {
                     fr / 1073741824.0, tot / 1073741824.0);
         std::fflush(stdout);
     }
+#if defined(STRATA_USE_HIP)
+    memlog_point("dense weights + K / V");
+#endif  // STRATA_USE_HIP
 
     // the experts into pinned host memory: the allocations, then the reads, several files at once.  IK2_HOST=mmap:
     // read where the files are mapped instead (pageable: slower copies, no 323 GiB of host memory - for several
@@ -5812,7 +6388,11 @@ int main(int argc, char** argv) {
                         if (l >= c.n_layer) return;
                         const size_t layer_bytes = (size_t) c.E * M.L[l].slot_bytes;
                         void* p = nullptr;
+#if defined(STRATA_USE_HIP)
+                        CU(halloc(&p, layer_bytes, hipHostMallocPortable));
+#else
                         CU(cudaHostAlloc(&p, layer_bytes, cudaHostAllocPortable));
+#endif  // STRATA_USE_HIP
                         pin.blocks[l] = {p, layer_bytes, false, false};
                         ready[l].store(1, std::memory_order_release);
                         if (--alloc_left == 0) t_alloc_end = now();
@@ -6022,13 +6602,36 @@ int main(int argc, char** argv) {
     W.gidx = work_alloc<int>(S_buf), W.inv = work_alloc<int>(S_buf);
     W.blob = work_alloc<const uint8_t*>(S8), W.tok = work_alloc<int>(S8);
     for (int i = 0; i < Work::kPackRing; ++i) {
+#if defined(STRATA_USE_HIP)
+        CU(halloc(&W.pack_h[i], 8192, hipHostMallocPortable));
+        W.pack_d[i] = work_alloc<uint8_t>(8192);
+        if (g_pool) CU(halloc(&W.y_h[i], (size_t) 64 * C * 4, hipHostMallocPortable));
+#else
         CU(cudaHostAlloc(&W.pack_h[i], 8192, cudaHostAllocPortable));
         W.pack_d[i] = work_alloc<uint8_t>(8192);
         if (g_pool) CU(cudaHostAlloc(&W.y_h[i], (size_t) 64 * C * 4, cudaHostAllocPortable));
+#endif  // STRATA_USE_HIP
     }
     W.T_host = (int) std::max<size_t>(T_buf, W.T_sup > 0 ? (size_t) ctx : 0);   // (a lent scratch can take up to ctx)
     const size_t S_host = (size_t) W.T_host * c.K;
     for (int i = 0; i < 2; ++i) {
+#if defined(STRATA_USE_HIP)
+        CU(halloc(&W.gidx_h[i], S_host * 4, hipHostMallocPortable));
+        CU(halloc(&W.inv_h[i], S_host * 4, hipHostMallocPortable));
+        CU(halloc(&W.sg_h[i], S_host * 4, hipHostMallocPortable));
+        CU(halloc(&W.su_h[i], S_host * 4, hipHostMallocPortable));
+        CU(halloc(&W.wt_h[i], S_host * 4, hipHostMallocPortable));
+        CU(halloc(&W.wtr_h[i], S_host * 4, hipHostMallocPortable));
+    }
+    CU(halloc(&W.x_h, (size_t) 8 * C * 4, hipHostMallocPortable));
+    CU(halloc(&W.emb_h, Tm * C * 4, hipHostMallocPortable));
+    CU(halloc(&W.pos_h, (size_t) W.T_host * 4, hipHostMallocPortable));
+    CU(halloc(&W.route_h, S_host * 8, hipHostMallocPortable));
+    W.argmax_d = work_alloc<int>(Tm);
+    CU(halloc(&W.argmax_h, Tm * 4, hipHostMallocPortable));
+    CU(halloc(&W.logits_h, (size_t) c.n_rows * 4, hipHostMallocPortable));
+    CU(halloc(&W.cand_h, (size_t) (2 + 2 * kCandCap) * 4, hipHostMallocPortable));
+#else
         CU(cudaHostAlloc(&W.gidx_h[i], S_host * 4, cudaHostAllocPortable));
         CU(cudaHostAlloc(&W.inv_h[i], S_host * 4, cudaHostAllocPortable));
         CU(cudaHostAlloc(&W.sg_h[i], S_host * 4, cudaHostAllocPortable));
@@ -6044,13 +6647,18 @@ int main(int argc, char** argv) {
     CU(cudaHostAlloc(&W.argmax_h, Tm * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&W.logits_h, (size_t) c.n_rows * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&W.cand_h, (size_t) (2 + 2 * kCandCap) * 4, cudaHostAllocPortable));
+#endif  // STRATA_USE_HIP
     {   // (IK2_RG_SLOTS: the slots - tokens x picks - up to which a prompt's experts go by groups; 0: never)
         // (96 tokens by default: past ~128 the FP16 GEMMs are the faster way)
         const int want = getenv("IK2_RG_SLOTS") ? std::atoi(getenv("IK2_RG_SLOTS")) : 96 * c.K;
         W.rg_slots = std::max(0, std::min(want, (int) std::max<size_t>(64, T_buf)));
         W.rg_groups = c.E + W.rg_slots / k::kGroupMax;
         W.rg_bytes = (size_t) W.rg_groups * (8 + 4 + 8 * k::kGroupMax) + (size_t) W.rg_slots * 16;
+#if defined(STRATA_USE_HIP)
+        CU(halloc(&W.rg_h, W.rg_bytes, hipHostMallocPortable));
+#else
         CU(cudaHostAlloc(&W.rg_h, W.rg_bytes, cudaHostAllocPortable));
+#endif  // STRATA_USE_HIP
         W.rg_d = work_alloc<uint8_t>(W.rg_bytes);
     }
     W.cand_d = work_alloc<int>(2 + 2 * kCandCap);
@@ -6216,8 +6824,30 @@ int main(int argc, char** argv) {
             }
         }
     }
+#if defined(STRATA_USE_HIP)
+    if ((g_memtrim & 1) && g_fast && !g_managed_experts) EC.free_bounce();
     std::fflush(stdout);
     }
+#ifndef _WIN32
+    if ((g_memtrim & 8) && g_fast && host_mmap && !g_managed_experts) {   // (every expert copied: the file's pages of them)
+        size_t dropped = 0;
+        for (const auto& J : exp_jobs) {
+            const size_t nb = tensor_bytes(*S.info(J.name)), pg = 4096;
+            const uintptr_t a0 = (uintptr_t) S.data(J.name) & ~(pg - 1), a1 = ((uintptr_t) S.data(J.name) + nb + pg - 1) & ~(pg - 1);
+            ::madvise((void*) a0, a1 - a0, MADV_DONTNEED);   // (a private read-only mapping: a later read faults it in)
+            const int fd = ::open(S.paths[S.file_of(J.name)].c_str(), O_RDONLY);
+            if (fd >= 0) posix_fadvise(fd, (off_t) S.file_offset(J.name), (off_t) nb, POSIX_FADV_DONTNEED), ::close(fd);
+            dropped += nb;
+        }
+        std::fprintf(stderr, "memtrim 0x08: the page cache of %.2f GiB of expert bytes dropped; MemAvailable %.2f GiB\n",
+                     dropped / 1073741824.0, proc_kb("/proc/meminfo", "MemAvailable") / 1073741824.0);
+    }
+#endif
+    memlog_point("load");
+#else
+    std::fflush(stdout);
+    }
+#endif  // STRATA_USE_HIP
     if (g_managed_experts) {
         CU(cudaStreamSynchronize(g_s));
         size_t remaining = 0, total = 0;
@@ -7083,7 +7713,11 @@ int main(int argc, char** argv) {
         struct Snap {
             int pos = -1;
             std::vector<float*> h;   // [layer * 4 + conv]
+#if defined(STRATA_USE_HIP)
+            std::vector<std::unique_ptr<uint8_t[]>> kv_k, kv_v;   // (IK2_MEMTRIM 0x10: not zero-filled)
+#else
             std::vector<std::vector<uint8_t>> kv_k, kv_v;
+#endif  // STRATA_USE_HIP
         };
         const size_t kv_elem_b = g_kv_fp8 ? 1 : 2;
         std::vector<Snap> snaps(8);
@@ -7097,8 +7731,13 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < 4; ++i) sn.h.push_back(dalloc<float>(3 * cc[i]));
                 if (Ly.sliding && Ly.kv_cap < ctx) {
                     const size_t bytes = (size_t) c.window * KD * kv_elem_b;
+#if defined(STRATA_USE_HIP)
+                    sn.kv_k[l].reset((g_memtrim & 0x10) ? new uint8_t[bytes] : new uint8_t[bytes]());
+                    sn.kv_v[l].reset((g_memtrim & 0x10) ? new uint8_t[bytes] : new uint8_t[bytes]());
+#else
                     sn.kv_k[l].resize(bytes);
                     sn.kv_v[l].resize(bytes);
+#endif  // STRATA_USE_HIP
                 }
             }
         }
@@ -7123,8 +7762,13 @@ int main(int argc, char** argv) {
                     const int n2 = w - n1;
                     uint8_t* dk = g_kv_fp8 ? Ly.kc8 : (uint8_t*) Ly.kc;
                     uint8_t* dv = g_kv_fp8 ? Ly.vc8 : (uint8_t*) Ly.vc;
+#if defined(STRATA_USE_HIP)
+                    uint8_t* hk = sn.kv_k[l].get();
+                    uint8_t* hv = sn.kv_v[l].get();
+#else
                     uint8_t* hk = sn.kv_k[l].data();
                     uint8_t* hv = sn.kv_v[l].data();
+#endif  // STRATA_USE_HIP
                     CU(cudaMemcpyAsync(save ? hk : dk + (size_t) s0 * row_b, save ? dk + (size_t) s0 * row_b : hk,
                                        (size_t) n1 * row_b, kv_dir, g_s));
                     CU(cudaMemcpyAsync(save ? hv : dv + (size_t) s0 * row_b, save ? dv + (size_t) s0 * row_b : hv,
@@ -7365,8 +8009,23 @@ int main(int argc, char** argv) {
             in_eof = true;
             in_cv.notify_one();
         }).detach();
+#if defined(STRATA_USE_HIP)
+        // IK2_MEMTRIM 0x04: IK2_IDLE_S s (60) without a request -> the work set's memory released (mapped back at the
+        // next line)
+        const double idle_s = getenv("IK2_IDLE_S") ? std::atof(getenv("IK2_IDLE_S")) : 60.0;
         auto next_line = [&](std::string& l) {
             std::unique_lock<std::mutex> lk(in_m);
+            if ((g_memtrim & 4) && !g_arena.empty() && !g_arena_released &&
+                !in_cv.wait_for(lk, std::chrono::duration<double>(idle_s), [&] { return !in_q.empty() || in_eof; })) {
+                lk.unlock();
+                work_release();
+                memlog_point("idle release");
+                lk.lock();
+            }
+#else
+        auto next_line = [&](std::string& l) {
+            std::unique_lock<std::mutex> lk(in_m);
+#endif  // STRATA_USE_HIP
             in_cv.wait(lk, [&] { return !in_q.empty() || in_eof; });
             if (in_q.empty()) return false;
             l = std::move(in_q.front());
@@ -7381,7 +8040,13 @@ int main(int argc, char** argv) {
         const bool spec_on = drafter && g_fast && g_block;
         sctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
         sctl.adapt = !(getenv("IK2_DRAFT_ADAPT") && !atoi(getenv("IK2_DRAFT_ADAPT")));
+#if defined(STRATA_USE_HIP)
+        bool first_logged = false;
         while (next_line(line)) {
+            if (line != "QUIT") work_restore();   // (IK2_MEMTRIM 0x04, after an idle release)
+#else
+        while (next_line(line)) {
+#endif  // STRATA_USE_HIP
             std::istringstream in(line);
             std::string cmd, stops_s, ids_s, emb_path;
             int max_new = 0, top_k = 0;
@@ -7438,6 +8103,14 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
+#if defined(STRATA_USE_HIP)
+            if (!kv_ensure((int) ids.size())) {   // (IK2_MEMTRIM 0x02: the prompt's K / V rows not backed - refused whole)
+                if (serve_maya) std::printf("ERR the K / V memory guard refused the prompt's rows\nDONE 0 %zu 0 0 cancel 0 0 0\n", ids.size());
+                else std::printf("@END error kv_memory %zu 0 0 0\n", ids.size());
+                std::fflush(stdout);
+                continue;
+            }
+#endif  // STRATA_USE_HIP
             g_img.clear();
             std::vector<uint64_t> sig(ids.size(), 0);
             if (!emb_path.empty()) {
@@ -7573,6 +8246,9 @@ int main(int argc, char** argv) {
                 snap_copy(sn, true);
             }
             place_decode(M, (int)ids.size());
+#if defined(STRATA_USE_HIP)
+            if (!first_logged) memlog_point("first prompt"), first_logged = true;
+#endif  // STRATA_USE_HIP
             const double t1 = now();
             if (getenv("IK2_STATS"))
                 std::printf("prefill stats: %zu tokens run, %llu expert copies (%.1f GiB) in %.2f s; experts that ran 1 / 2 / 3-7 / 8+ "
@@ -7715,6 +8391,12 @@ int main(int argc, char** argv) {
                     }
                     continue;
                 }
+#if defined(STRATA_USE_HIP)
+                if (!kv_ensure((int) hist.size() + 1)) {   // (IK2_MEMTRIM 0x02: no room for the next row - ends here)
+                    std::fprintf(stderr, "memtrim 0x02: the request ends at %zu tokens (K / V memory guard)\n", hist.size() + 1);
+                    break;   // (as at max_new: tok emitted, not run - hist and last stay the state's)
+                }
+#endif  // STRATA_USE_HIP
                 const double tp0 = now();
                 if (temp <= 0) {
                     std::vector<float> lo;
@@ -7757,6 +8439,7 @@ int main(int argc, char** argv) {
     }
     if ((int) prompt.size() + gen > ctx) die("prompt + gen past --ctx");
 #if defined(STRATA_USE_HIP)
+    if (!kv_ensure((int) prompt.size() + gen)) die("memtrim 0x02: the K / V of prompt + gen cannot be backed (memory guard)");
     // IK2_PF_AB="0,1,3,7,15" (IK2_HBPF values; IK2_PF_REPS, 3): before the prompt run below, the prompt's prefill timed
     // with each value in turn - one load, the arms interleaved, rep 0 a warm-up - a line "pf_ab" each with the first
     // token's argmax.  Order: rep r starts at arm r (a rotation), odd reps reversed, so an arm meets both neighbours on
@@ -7882,6 +8565,7 @@ int main(int argc, char** argv) {
 #if defined(STRATA_USE_HIP)
     hb_check_summary();
     std::fflush(stdout);
+    memlog_point("first prompt");
     if (all || logp_last) {
         // log-probabilities of every prompt position (IK2_LOGP_LAST: of the last N)
         const size_t np = logits.size() / c.n_vocab;
