@@ -1238,6 +1238,45 @@ struct ExpertCache {
             bytes_up += Ly.slot_bytes;
             return;
         }
+#if defined(STRATA_USE_HIP)
+        // gfx1151 (Strix Halo, one RAM for CPU and GPU): cudaMemcpyAsync straight from the file mapping crawled here (2-58 MB/s,
+        // the main thread waiting inside libhsa under copy_in, by gdb) once the 14.7 GiB of
+        // expert pools sit in the same RAM, while pinned memory copies at 65 GB/s. So the mapped
+        // bytes go through a ring of pinned bounce buffers: CPU memcpy (page cache) -> one DMA per expert.
+        const size_t need = Ly.eb[0] + Ly.eb[1] + Ly.eb[2];
+        if (bounce_cap < need) {
+            for (int i = 0; i < kBounce; ++i) {
+                if (bounce[i]) {
+                    if (bounce_used[i]) CU(cudaEventSynchronize(bounce_ev[i]));
+                    CU(hipHostFree(bounce[i]));
+                } else {
+                    CU(cudaEventCreateWithFlags(&bounce_ev[i], cudaEventDisableTiming));
+                }
+                CU(cudaHostAlloc((void**) &bounce[i], need, hipHostMallocDefault));
+                bounce_used[i] = false;
+            }
+            bounce_cap = need;
+        }
+        const int i = bounce_next;
+        bounce_next = (bounce_next + 1) % kBounce;
+        if (bounce_used[i]) CU(cudaEventSynchronize(bounce_ev[i]));   // (its last DMA is done before it is refilled)
+        size_t off = 0;
+        for (int r = 0; r < 3; ++r) {
+            std::memcpy(bounce[i] + off, Ly.host[r] + (size_t) e * Ly.stride[r], Ly.eb[r]);
+            off += Ly.eb[r];
+        }
+        CU(cudaMemcpyAsync(dst, bounce[i], off, cudaMemcpyHostToDevice, st));
+        CU(cudaEventRecord(bounce_ev[i], st));
+        bounce_used[i] = true;
+        bytes_up += off;
+    }
+    static constexpr int kBounce = 4;   // (4 x one expert's bytes, <= 4 x 8.1 MiB pinned)
+    uint8_t* bounce[kBounce] = {};
+    cudaEvent_t bounce_ev[kBounce] = {};
+    bool bounce_used[kBounce] = {};
+    size_t bounce_cap = 0;
+    int bounce_next = 0;
+#else
         size_t off = 0;
         for (int r = 0; r < 3; ++r) {
             CU(cudaMemcpyAsync(dst + off, Ly.host[r] + (size_t) e * Ly.stride[r], Ly.eb[r], cudaMemcpyHostToDevice, st));
@@ -1245,6 +1284,7 @@ struct ExpertCache {
             bytes_up += Ly.eb[r];
         }
     }
+#endif  // STRATA_USE_HIP
 };
 
 // ---- the forward
@@ -3389,7 +3429,11 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
 
 void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode out_mode, const std::string& dump,
              std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp, int slot = 0) {
+#if defined(STRATA_USE_HIP)
+    k::enable_grouped_tensor_products(false);   // HIP: the grouped tensor-core products are compiled out
+#else
     k::enable_grouped_tensor_products(allow_short_batch_products());
+#endif  // STRATA_USE_HIP
     const Config& c = M.c;
     const int C = c.C;
     if (g_fast && T == 1 && dump.empty() && !g_prof && !g_rec && !g_trace && g_pop.empty() && g_img.at(pos0) < 0) {
@@ -4726,6 +4770,21 @@ int main(int argc, char** argv) {
     g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
     if (g_parallel > 1 && n_gpu > 1) die("--parallel > 1 requires --gpus 1");
+#if defined(STRATA_USE_HIP)
+    // AMD: the tensor-core (PTX) paths are not in this build - a setting that picks one is a hard error and the
+    // defaults are the scalar kernels; the verify window goes through forward() (the block path is tensor-core only).
+    // --parallel > 1 too: its batched decode attention (attn_slots) is a tensor-core path.
+    if (g_parallel > 1) die("--parallel > 1: the batched decode attention is a tensor-core path, not in the AMD build");
+    for (const char* v : {"IK2_ATTN_MMA", "IK2_EXPERT_MMA", "IK2_FLASH", "IK2_Q8_TILE", "IK2_BLOCK", "IK2_GROUP_MMA"})
+        if (getenv(v) && std::atoi(getenv(v)))
+            die(std::string(v) + "=" + getenv(v) + ": a tensor-core path, compiled out of this HIP build");
+    g_attn_mma = 0, g_flash = false, g_block = false;
+    {
+        cudaDeviceProp pr{};
+        CU(cudaGetDeviceProperties(&pr, 0));
+        if (pr.warpSize != 32) die("the kernels assume 32 lanes: a wave32 device (gfx11) is needed");
+    }
+#endif  // STRATA_USE_HIP
     if (n_gpu == 1 && getenv("IK2_KV_MANAGED") && atoi(getenv("IK2_KV_MANAGED"))) {
         if (g_parallel > 1) die("--parallel > 1 is not supported with IK2_KV_MANAGED");
         int concurrent = 0;
@@ -4786,6 +4845,15 @@ int main(int argc, char** argv) {
         const bool fits = exp_b + dense_b + kv_b + par_fixed + draft_b + (size_t) ctx * draft_tok + reserve <= fr0 &&
                           exp_b <= (size_t) (cache_gb * 1073741824.0);
         if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
+#if defined(STRATA_USE_HIP)
+        // AMD APU (one RAM for CPU and GPU, e.g. Strix Halo): the non-resident path would keep a pinned host copy of
+        // every expert AND a device cache of them - the same DRAM twice (2 x 14.7 GiB on a 32 GB box). Refuse it.
+        int integrated = 0;
+        CU(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0));
+        if (!fits && integrated)
+            die("the experts do not all fit on the device (" + std::to_string(fr0 >> 20) + " MiB free): the pinned-host "
+                "path would hold them twice on unified memory - lower --ctx, free memory or raise the GTT limit");
+#endif  // STRATA_USE_HIP
         g_fast_want = fits && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
         stage_cold = getenv("IK2_STAGE_COLD") && atoi(getenv("IK2_STAGE_COLD"));
         g_managed_experts = g_fast_want && g_kv_managed && getenv("IK2_TIER") && atoi(getenv("IK2_TIER"));
