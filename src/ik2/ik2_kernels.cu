@@ -10,6 +10,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if defined(STRATA_USE_HIP)
+#include <utility>
+#endif  // STRATA_USE_HIP
 
 namespace ik2::k {
 namespace {
@@ -6791,5 +6794,6 @@ void attn_slots_f16(const uint16_t*, const float*, int, const float*, const uint
 // the AMD build's own kernels (wave32 RDNA 3 / 3.5, measured on gfx1151): docs/AMD_INKLING2_GFX1151.md
 #include "ik2_fuse.inc"      // IK2_FUSE_MASK: the resident decode's small kernels, fewer and shorter
 #include "ik2_experts2.inc"  // IK2_FUSE_MASK 0x1000..0x8000: batch-1 expert GEMVs, x in registers
+#include "ik2_hbpf.inc"      // IK2_HBPF: prefill kernels ported from headbouyJB/inkling2-gufo (MIT)
 #endif  // STRATA_USE_HIP
 }  // namespace ik2::k

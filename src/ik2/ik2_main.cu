@@ -689,6 +689,73 @@ void mv1c(const Mat& m, const float* x, float* y, const k::MvConv& c0, const k::
         if (cv->n) k::conv4_res(y + cv->r0, cv->hist, cv->w, cv->dyn, cv->heads, 1, cv->n, cv->res, cv->y, g_s);
 }
 
+#if defined(STRATA_USE_HIP)
+// IK2_HBPF (a bit a class; unset / 0 = the prefill as before, bit for bit): the prefill kernels ported from
+// headbouyJB/inkling2-gufo (MIT; ik2_hbpf.inc) on chunks of kHbMinT tokens or more - 1 the experts (grouped on the
+// GPU, two tiled WMMA GEMMs a visit), 2 the dense Q8_0 products, 4 the attention, 8 no route copy / host sync a visit
+// (with bit 1's experts), 16 a looped visit's loop gates + their norm in one kernel a gate, 32 the projections'
+// parts straight into their buffers (no unpack; with 2) - 64 (with 1) the expert GEMMs'
+// late-dequant K step (k_gemm4 PIPE, the same sums bit for bit); 128 (with 1) the
+// expert GEMMs in upstream gufo's routed kernel shape (k_rg: 128 rows x 192 / 128 tokens, weights in registers, decoded
+// once a wave; the same sums as k_gemm4) - bit 6 is then unused
+int g_hbpf = 0;
+constexpr int kHbMinT = 64;
+// the experts' token tile (hb_moe_route's items): bit 7's k_rg 192 from 2048 tokens (mikealanni/gufo's Inkling choice:
+// T / 16 picks an expert, one tile holds most), else 128; k_gemm4 64 from 1024 (headbouy's engine.cpp:927), else 32
+int hb_tile(int T) { return (g_hbpf & 128) ? (T >= 2048 ? 192 : 128) : (T >= 1024 ? 64 : 32); }
+// IK2_HBPF_CHECK=1 (tests, with IK2_HBPF): every call of a set bit's site also runs the old path, and the new one
+// twice: a line "hb check" each (max |new - old|, that over max |old|, RMS of the difference over RMS of old, and
+// whether the two new runs are the same to the bit); the worst per class at the end of the prompt (hb_check_summary)
+int g_hbpf_check = 0;
+// IK2_HBPF_PROBE (a kernel trace only, with bit 6): 1 / 2 also launch the expert GEMMs without fragment reads / without
+// dequant (k_gemm4 PROBE; wrong values on purpose, overwritten by the real kernels after them) - the price of each part
+int g_hbpf_probe = 0;
+struct HbCheck {
+    double max_abs = 0, max_rel = 0, rms_rel = 0;
+    long calls = 0, not_identical = 0;
+} g_hbck[4];   // experts, dense, attention, gates (bit 4)
+const char* const kHbClass[4] = {"experts", "dense", "attention", "gates"};
+std::vector<float> hb_host(const float* d, int rows, int cols, int ld) {   // (synchronous: a check only)
+    std::vector<float> h((size_t) rows * cols);
+    CU(cudaStreamSynchronize(g_s));
+    CU(cudaMemcpy2D(h.data(), (size_t) cols * 4, d, (size_t) ld * 4, (size_t) cols * 4, rows, cudaMemcpyDeviceToHost));
+    return h;
+}
+void hb_compare(int cls, const char* what, const std::vector<float>& o, const std::vector<float>& n1,
+                const std::vector<float>& n2) {
+    double mo = 0, md = 0, so = 0, sd = 0;
+    for (size_t i = 0; i < o.size(); ++i) {
+        const double d = std::fabs((double) n1[i] - o[i]);
+        mo = std::max(mo, (double) std::fabs(o[i]));
+        md = std::isnan(d) ? INFINITY : std::max(md, d);
+        so += (double) o[i] * o[i];
+        sd += d * d;
+    }
+    const bool same = std::memcmp(n1.data(), n2.data(), n1.size() * 4) == 0;
+    const double rel = md / std::max(mo, 1e-30), rms = std::sqrt(sd / std::max(so, 1e-300));
+    HbCheck& k = g_hbck[cls];
+    k.max_abs = std::max(k.max_abs, md), k.max_rel = std::max(k.max_rel, rel), k.rms_rel = std::max(k.rms_rel, rms);
+    ++k.calls, k.not_identical += !same;
+    std::printf("hb check %s %s: %zu values, max|new-old| %.3g (max|old| %.3g, rel %.3g), rms rel %.3g, two new runs %s\n",
+                kHbClass[cls], what, o.size(), md, mo, rel, rms, same ? "identical" : "DIFFER");
+}
+long g_hb_items = 0, g_hb_items_min = 0, g_hb_bx_calls[2] = {}, g_hb_bx_differ[2] = {};   // (CHECK: tiles; bits 6, 7 identity)
+void hb_check_summary() {
+    if (g_hb_items_min)
+        std::printf("hb check summary experts tiles: %ld items over the visits checked, %ld at the fewest (picks / tile): "
+                    "%+.1f %% WMMA rows for padding\n", g_hb_items, g_hb_items_min,
+                    100.0 * (double) (g_hb_items - g_hb_items_min) / (double) g_hb_items_min);
+    for (int b = 0; b < 2; ++b)
+        if (g_hb_bx_calls[b])
+            std::printf("hb check summary experts bit %d: %ld calls, %ld not identical to bit %d off\n", 6 + b,
+                        g_hb_bx_calls[b], g_hb_bx_differ[b], 6 + b);
+    for (int i = 0; i < 4; ++i)
+        if (g_hbck[i].calls)
+            std::printf("hb check summary %s: %ld calls, worst max|new-old| %.3g, worst rel %.3g, worst rms rel %.3g, "
+                        "%ld calls not identical run to run\n", kHbClass[i], g_hbck[i].calls, g_hbck[i].max_abs,
+                        g_hbck[i].max_rel, g_hbck[i].rms_rel, g_hbck[i].not_identical);
+}
+#endif  // STRATA_USE_HIP
 bool g_rec = false;
 bool allow_short_batch_products() {
     static const bool verify_only = getenv("IK2_VERIFY_ONLY") && atoi(getenv("IK2_VERIFY_ONLY"));
@@ -699,6 +766,25 @@ size_t g_w16_n = 0;          // values it holds
 // Y [T][N] = X [T][K] . W^T: one token straight over the blocks (x32), more through an FP16 decode and a GEMM (x16).
 // A matrix larger than the decode buffer (the head: its few rows of logits) goes a token at a time over its blocks.
 void matmul(const Mat& m, const float* x32, const uint16_t* x16, int T, float* Y, int ldy) {
+#if defined(STRATA_USE_HIP)
+    if ((g_hbpf & 2) && m.q8 && x16 && T >= kHbMinT && k::hb_dense_fits(m.N, m.K)) {   // IK2_HBPF bit 1
+        std::vector<float> o;
+        if (g_hbpf_check) {
+            g_hbpf &= ~2;
+            matmul(m, x32, x16, T, Y, ldy);
+            g_hbpf |= 2;
+            o = hb_host(Y, T, m.N, ldy);
+        }
+        k::hb_dense(m.q8, m.q8d, m.N, m.K, x16, T, Y, ldy, g_s);
+        if (g_hbpf_check) {
+            const auto n1 = hb_host(Y, T, m.N, ldy);
+            k::hb_dense(m.q8, m.q8d, m.N, m.K, x16, T, Y, ldy, g_s);
+            const std::string w = std::to_string(m.N) + "x" + std::to_string(m.K) + " T " + std::to_string(T);
+            hb_compare(1, w.c_str(), o, n1, hb_host(Y, T, m.N, ldy));
+        }
+        return;
+    }
+#endif  // STRATA_USE_HIP
     if (m.f16) {
         gemm16(m.f16, m.N, m.K, x16, T, Y, ldy);
         return;
@@ -1545,6 +1631,50 @@ void loop_gates_chunk(Work& W, const k::LoopGate* gt, int n, int T, int C, int R
         k::loop_gate_blend(gt[j].x, gt[j].m, f, gn, (size_t) T * C, gt[j].y, g_s);
     }
 }
+#if defined(STRATA_USE_HIP)
+// A looped visit's gates and the norm after them: y16[j] = rms(gate j's y) * nw[j] (rms_f16; y32o[j] its F32 copy
+// when not null).  IK2_HBPF bit 16 (T >= kHbMinT): one kernel a gate (k::hb_ctl_prefill), gt[j].y not written - at
+// these T no product reads the F32 inputs (matmul takes x16 from T >= 4); else loop_gates_chunk + rms_f16 as before.
+void loop_gates_norm(Work& W, const k::LoopGate* gt, int n, int T, int C, int R, const float* const* nw, float eps,
+                     uint16_t* const* y16, float* const* y32o) {
+    auto old = [&]() {
+        loop_gates_chunk(W, gt, n, T, C, R, 1e-6f);
+        for (int j = 0; j < n; ++j) k::rms_f16(gt[j].y, nw[j], T, C, eps, y16[j], y32o[j], g_s);
+    };
+    if (!(g_hbpf & 16) || T < kHbMinT || !k::hb_ctl_fits(C, R)) return old();
+    k::CtlJob jobs[3];
+    for (int j = 0; j < n; ++j) jobs[j] = {gt[j].x, gt[j].m, gt[j].D, gt[j].F, gt[j].G, nw[j], y16[j], y32o[j]};
+    if (!g_hbpf_check) return k::hb_ctl_prefill(jobs, n, T, 1e-6f, eps, g_s);
+    // (check: the old path, then the new twice; y16 compared as floats.  The old one writes gt[j].y, which may be
+    //  x (the MoE's gate): the new reads x, so the old runs on a copy of x in W.tmp)
+    auto h16 = [&](const uint16_t* d) {
+        std::vector<uint16_t> u((size_t) T * C);
+        CU(cudaStreamSynchronize(g_s));
+        CU(cudaMemcpy(u.data(), d, u.size() * 2, cudaMemcpyDeviceToHost));
+        std::vector<float> f(u.size());
+        for (size_t i = 0; i < u.size(); ++i) f[i] = (float) __builtin_bit_cast(_Float16, u[i]);
+        return f;
+    };
+    std::vector<k::LoopGate> g2(gt, gt + n);
+    for (int j = 0; j < n; ++j)
+        if (gt[j].y == gt[j].x) {   // (n is 1 then)
+            CU(cudaMemcpyAsync(W.tmp, gt[j].x, (size_t) T * C * 4, cudaMemcpyDeviceToDevice, g_s));
+            jobs[j].x = W.tmp;
+        }
+    loop_gates_chunk(W, g2.data(), n, T, C, R, 1e-6f);
+    for (int j = 0; j < n; ++j) k::rms_f16(g2[j].y, nw[j], T, C, eps, y16[j], nullptr, g_s);
+    std::vector<std::vector<float>> o;
+    for (int j = 0; j < n; ++j) o.push_back(h16(y16[j]));
+    k::hb_ctl_prefill(jobs, n, T, 1e-6f, eps, g_s);
+    std::vector<std::vector<float>> n1;
+    for (int j = 0; j < n; ++j) n1.push_back(h16(y16[j]));
+    k::hb_ctl_prefill(jobs, n, T, 1e-6f, eps, g_s);
+    for (int j = 0; j < n; ++j) {
+        const std::string w = "gate " + std::to_string(j) + " of " + std::to_string(n) + " T " + std::to_string(T);
+        hb_compare(3, w.c_str(), o[j], n1[j], h16(y16[j]));
+    }
+}
+#endif  // STRATA_USE_HIP
 
 // One layer's attention + post-attention conv + residual into r_out ([T][C]).
 // h_in ([T][C]) is unmodified and acts as the residual input; when l % c.block == 0, it is saved to blk(nb).
@@ -1574,9 +1704,14 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         for (int j = 0; j < 3; ++j)
             gt[j] = {W.lp_in + (size_t) (Ly.n_res_q == 3 ? j : 0) * TC, msg + (size_t) j * TC, Ly.lp_down[j],
                      Ly.lp_forget[j], Ly.lp_gain[j], y32[j]};
+#if defined(STRATA_USE_HIP)
+        float* y32o[3] = {need_x32 ? y32[0] : nullptr, need_x32 ? y32[1] : nullptr, need_x32 ? y32[2] : nullptr};
+        loop_gates_norm(W, gt, 3, T, C, c.rank, nw, c.eps, y16, y32o);
+#else
         loop_gates_chunk(W, gt, 3, T, C, c.rank, 1e-6f);
         for (int j = 0; j < 3; ++j)
             k::rms_f16(y32[j], nw[j], T, C, c.eps, y16[j], need_x32 ? y32[j] : nullptr, g_s);
+#endif  // STRATA_USE_HIP
         in_q = W.xq, in_k = W.xk, in_v = W.xv;
         xk16 = W.xk16, xv16 = W.xv16;
     } else if (l > 0) {
@@ -1612,7 +1747,22 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     float *q_p = W.q, *k_p = W.kk, *v_p = W.vv, *r_p = W.rr, *gate_p = W.gate, *sink_p = W.sink;
     float *kd_p = W.dyn, *vd_p = W.dyn;
     if (Ly.sliding) {
+#if defined(STRATA_USE_HIP)
+        // IK2_HBPF bit 32 (with bit 2's dense GEMMs): each part's rows straight into its buffer (q, k,
+        // v, r, gate), no [T][N] product and no unpack_segments copy (2 x T x N x 4 bytes); the same tiles and sums
+        const bool seg = (g_hbpf & 32) && (g_hbpf & 2) && T >= kHbMinT && g_dense_q8 && Ly.wqkvrg.q8 &&
+                         k::hb_dense_fits(HD, C) && k::hb_dense_fits(KD, C) && k::hb_dense_fits(HR, C);
+        if (Ly.wqkvrg.N > 0 && seg) {
+            matmul_rows(Ly.wqkvrg, 0, HD, in_q, W.x16, T, W.q, HD);
+            matmul_rows(Ly.wqkvrg, HD, KD, in_k, xk16, T, W.kk, KD);
+            matmul_rows(Ly.wqkvrg, HD + KD, KD, in_v, xv16, T, W.vv, KD);
+            matmul_rows(Ly.wqkvrg, HD + 2 * KD, HR, in_q, W.x16, T, W.rr, HR);
+            matmul_rows(Ly.wqkvrg, HD + 2 * KD + HR, HD, in_q, W.x16, T, W.gate, HD);
+            gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
+        } else if (Ly.wqkvrg.N > 0) {
+#else
         if (Ly.wqkvrg.N > 0) {
+#endif  // STRATA_USE_HIP
             if (msg) {   // the fused rows by the input they take: q | k | v | r, gate (and the sink)
                 const int N = Ly.wqkvrg.N;
                 matmul_rows(Ly.wqkvrg, 0, HD, in_q, W.x16, T, W.qkv, N);
@@ -1651,7 +1801,18 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         k::conv4(k_p, Ly.h_k, Ly.sc_k, nullptr, 0, T, KD, W.kconv, g_s);
         k::conv4(v_p, Ly.h_v, Ly.sc_v, nullptr, 0, T, KD, W.vconv, g_s);
     } else {
+#if defined(STRATA_USE_HIP)
+        const bool seg = (g_hbpf & 32) && (g_hbpf & 2) && T >= kHbMinT && g_dense_q8 && Ly.wqrg.q8 &&
+                         k::hb_dense_fits(HD, C) && k::hb_dense_fits(HR, C);   // (bit 32, as the sliding layers')
+        if (Ly.wqrg.N > 0 && seg) {
+            matmul_rows(Ly.wqrg, 0, HD, in_q, W.x16, T, W.q, HD);
+            matmul_rows(Ly.wqrg, HD, HR, in_q, W.x16, T, W.rr, HR);
+            matmul_rows(Ly.wqrg, HD + HR, HD, in_q, W.x16, T, W.gate, HD);
+            gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
+        } else if (Ly.wqrg.N > 0) {
+#else
         if (Ly.wqrg.N > 0) {
+#endif  // STRATA_USE_HIP
             matmul(Ly.wqrg, in_q, W.x16, T, W.qkv, Ly.wqrg.N);
             const bool has_sink = !g_dense_q8;
             if (T == 1) {
@@ -1752,6 +1913,12 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                               Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s, Ly.page_table);
         }
     } else {
+#if defined(STRATA_USE_HIP)
+        // IK2_HBPF bit 2: one flash pass over the cache (attn_old: the GEMMs + softmax rows below, as before)
+        const bool hb_attn = (g_hbpf & 4) && !g_kv_fp8 && T >= kHbMinT && Ly.kv_cap > 0 &&
+                             k::hb_attn_fits(c.H, c.KV, c.D, c.d_rel);
+        auto attn_old = [&]() {
+#endif  // STRATA_USE_HIP
         k::to_f16(q_p, (size_t) T * HD, W.x16, g_s);
         uint16_t* lg16 = W.lg16;
         const int GQA = c.H / c.KV;
@@ -1868,6 +2035,27 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             }
             ts += Tq;
         }
+#if defined(STRATA_USE_HIP)
+        };   // (attn_old)
+        if (!hb_attn || g_hbpf_check) attn_old();
+        if (hb_attn) {
+            std::vector<float> o;
+            if (g_hbpf_check) o = hb_host(W.o, T, HD, HD);
+            auto run = [&]() {
+                k::to_f16(q_p, (size_t) T * HD, W.x16, g_s);
+                k::hb_attn_prefill(W.x16, r_p, sink_p, Ly.kc, Ly.vc, Ly.kv_cap, T, pos0, window, extent, Ly.rel_proj,
+                                   qk_scale, W.o, g_s);
+            };
+            run();
+            if (g_hbpf_check) {
+                const auto n1 = hb_host(W.o, T, HD, HD);
+                run();
+                const std::string w = std::string(Ly.sliding ? "sliding" : "global") + " layer " + std::to_string(l) +
+                                      " T " + std::to_string(T) + " pos0 " + std::to_string(pos0);
+                hb_compare(2, w.c_str(), o, n1, hb_host(W.o, T, HD, HD));
+            }
+        }
+#endif  // STRATA_USE_HIP
     }
     k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && T == 1, g_s);
     matmul(Ly.wo, W.o, W.x16, T, W.tmp, C);
@@ -1938,7 +2126,11 @@ __global__ void combine_prefill_groups(const float* y, const int* rows, const fl
 }
 
 void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq16, const int* top, const float* w,
+#if defined(STRATA_USE_HIP)
+                     const float* r_in, float* h_out, Work& W, ExpertCache& EC, double& t_exp, bool post = true) {
+#else
                      const float* r_in, float* h_out, Work& W, ExpertCache& EC, double& t_exp) {
+#endif  // STRATA_USE_HIP
     const Config& c = M.c;
     const int C = c.C, F = c.F, S = T * c.K;
     const double te0 = now();
@@ -2206,6 +2398,48 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
     }
     g_pf.lap(g_pf.experts);
     t_exp += now() - te0;
+#if defined(STRATA_USE_HIP)
+    if (!post) return;   // (IK2_HBPF_CHECK: the experts' sum in W.tmp only)
+    conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
+    k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, r_in, h_out, g_s);
+}
+
+// IK2_HBPF bit 0: a chunk's experts on the GPU from the device picks (top_d / w_d [T K], route()'s): grouped by
+// expert (hb_moe_route), gate_up + activation and down as tiled WMMA GEMMs over the resident blobs, the 8 slots of a
+// token summed in slot order into W.tmp; then the post-conv and the residual as run_prefill_moe.  The scratch (h
+// [T K][F] F16, pairs [T K][C] F32) is W.lg: attention is done with it until the next visit.
+void run_prefill_moe_hb(const Model& M, Layer& Ly, int T, const uint16_t* x16, const int* top_d, const float* w_d,
+                        const float* r_in, float* h_out, Work& W, double& t_exp, bool post = true, int* items = nullptr) {
+    const Config& c = M.c;
+    const int C = c.C, F = c.F, S = T * c.K;
+    const double te0 = now();
+    static k::HbMoeWs ws{};
+    static int ws_S = 0;
+    if (S > ws_S) {   // (once: a chunk's picks at most; the items at most S / 32 + E)
+        for (int* p : {ws.cnt, ws.goff, ws.fill, ws.nitems, ws.item_e, ws.item_start, ws.item_n, ws.postok, ws.pair})
+            if (p) CU(cudaFree(p));
+        if (ws.posw) CU(cudaFree(ws.posw));
+        const int S_max = std::max(S, (int) W.Tm * c.K), items = S_max / 32 + c.E;
+        ws.cnt = dalloc<int>(c.E), ws.goff = dalloc<int>(c.E + 1), ws.fill = dalloc<int>(c.E), ws.nitems = dalloc<int>(1);
+        ws.item_e = dalloc<int>(items), ws.item_start = dalloc<int>(items), ws.item_n = dalloc<int>(items);
+        ws.postok = dalloc<int>(S_max), ws.pair = dalloc<int>(S_max), ws.posw = dalloc<float>(S_max);
+        ws_S = S_max;
+    }
+    const int tile = hb_tile(T);
+    uint16_t* h16 = (uint16_t*) W.lg;
+    float* pairs = (float*) (h16 + (size_t) S * F);
+    k::hb_moe_route(top_d, w_d, S, tile, ws, g_s);
+    k::hb_moe_prefill(Ly.ty[0], tile, Ly.tab_blob, Ly.eb[0] + Ly.eb[1], Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2],
+                      c.gate_cap, c.up_cap, x16, h16, pairs, W.tmp, T, ws, (g_hbpf & 64) != 0, (g_hbpf & 128) != 0,
+                      g_hbpf_probe, g_s);
+    if (items) {   // (a check only: synchronous)
+        CU(cudaStreamSynchronize(g_s));
+        CU(cudaMemcpy(items, ws.nitems, 4, cudaMemcpyDeviceToHost));
+    }
+    g_pf.lap(g_pf.experts);
+    t_exp += now() - te0;
+    if (!post) return;
+#endif  // STRATA_USE_HIP
     conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
     k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, r_in, h_out, g_s);
 }
@@ -3785,8 +4019,15 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             if (msg) {   // (its message gates the input before the norm)
                 k::attn_res(st, nb + 1, Ly.ffn_res_score, 1, T, C, 1e-6f, W.xq, g_s);
                 const k::LoopGate gt{W.xq, msg + (size_t) 3 * TC, Ly.lp_down[3], Ly.lp_forget[3], Ly.lp_gain[3], W.xq};
+#if defined(STRATA_USE_HIP)
+                const float* nw[1] = {Ly.ffn_norm};
+                uint16_t* y16[1] = {W.x16};
+                float* y32o[1] = {W.xq};   // (rms_f16's F32 output: the short-prompt expert paths read it)
+                loop_gates_norm(W, &gt, 1, T, C, c.rank, nw, c.eps, y16, y32o);
+#else
                 loop_gates_chunk(W, &gt, 1, T, C, c.rank, 1e-6f);
                 k::rms_f16(W.xq, Ly.ffn_norm, T, C, c.eps, W.x16, W.xq, g_s);
+#endif  // STRATA_USE_HIP
             } else {
                 k::RmsOuts outs{};
                 outs.w[0] = Ly.ffn_norm;
@@ -3801,7 +4042,19 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
+#if defined(STRATA_USE_HIP)
+        // IK2_HBPF bit 0: the experts grouped and run on the GPU (the resident path's experts, one GPU, the chunk past
+        // the short-prompt groups); bit 3 with it: the picks stay on the device (no copy, no host sync this visit)
+        const bool hb_moe = (g_hbpf & 1) && g_fast && !g_ep && !g_tp && T >= kHbMinT && S > W.rg_slots &&
+                            !g_trace && !Ly.tab_h.empty() && g_seq_done + 1 >= g_seq_next &&
+                            W.pf_layers[l % Work::kPfRing] != l &&
+                            k::hb_moe_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F, c.E, c.K) &&
+                            (size_t) S * (c.F * 2 + C * 4) <= W.lg_cap * 4;
+        const bool hb_nosync = hb_moe && (g_hbpf & 8) && g_pop.empty() && dump.empty() && !g_hbpf_check;
+        if (!hb_nosync) CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
+#else
         CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
+#endif  // STRATA_USE_HIP
         // (Q8_0 experts too with IK2_CPU_Q8=1: the last layers of unsloth's UD-Q4_K_XL)
         const bool lane_q8 = g_cpu_q8 && Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0 && Ly.ty[2] == k::kQ8_0;
         const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= 8 &&
@@ -3809,11 +4062,58 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         double& t_cpu = g_t_cpu_f[lane_q8 ? 1 : 0];
         const double t_up = lane_q8 ? g_t_up * (34.0 / 32.0) / (36.0 / 64.0) : g_t_up;   // (the blocks' bytes a value)
         if (cpu_lane) CU(cudaMemcpyAsync(W.x_h, W.xq, TC * 4, cudaMemcpyDeviceToHost, g_s));
+#if defined(STRATA_USE_HIP)
+        if (!hb_nosync) CU(cudaStreamSynchronize(g_s));
+        const int* top = W.route_h;
+        const float* w = (const float*) (W.route_h + S);
+        if (!hb_nosync) pop_count(l, top, S);
+        g_pf.lap(g_pf.route);
+        if (hb_moe && !dump.empty()) {   // the experts picked (as below)
+            FILE* f = std::fopen((dump + "/blk." + std::to_string(vis) + ".picks.i32").c_str(), "wb");
+            if (f) std::fwrite(top, 4, (size_t) S, f), std::fclose(f);
+        }
+        if (hb_moe) {
+            std::vector<float> o;
+            if (g_hbpf_check) {
+                run_prefill_moe(M, Ly, l, T, W.x16, top, w, W.r, W.h, W, EC, t_exp, false);
+                o = hb_host(W.tmp, T, C, C);
+                int items = 0;
+                run_prefill_moe_hb(M, Ly, T, W.x16, rtop, rw, W.r, W.h, W, t_exp, false, &items);
+                const auto n1 = hb_host(W.tmp, T, C, C);
+                const int tile = hb_tile(T), fewest = (S + tile - 1) / tile;   // (run_prefill_moe_hb's tile)
+                g_hb_items += items, g_hb_items_min += fewest;
+                std::string b6;
+                for (int b = 0; b < 2; ++b) {   // bits 6, 7 = the same sums: the result against the bit off, to the bit
+                    const int bit = 64 << b;
+                    if (!(g_hbpf & bit)) continue;
+                    g_hbpf &= ~bit;
+                    run_prefill_moe_hb(M, Ly, T, W.x16, rtop, rw, W.r, W.h, W, t_exp, false);
+                    g_hbpf |= bit;
+                    const bool same = std::memcmp(hb_host(W.tmp, T, C, C).data(), n1.data(), n1.size() * 4) == 0;
+                    ++g_hb_bx_calls[b], g_hb_bx_differ[b] += !same;
+                    b6 += ", bit " + std::to_string(6 + b) + (same ? " vs off identical" : " vs off DIFFER");
+                }
+                run_prefill_moe_hb(M, Ly, T, W.x16, rtop, rw, W.r, W.h, W, t_exp, false);
+                const std::string wh = std::string(Ly.ty[0] == k::kNVFP4 ? "NVFP4" : "Q8_0") + " visit " +
+                                       std::to_string(vis) + " layer " + std::to_string(l) + " T " + std::to_string(T) +
+                                       " items " + std::to_string(items) + " (fewest " + std::to_string(fewest) + ")" + b6;
+                hb_compare(0, wh.c_str(), o, n1, hb_host(W.tmp, T, C, C));
+                conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
+                k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            } else {
+                run_prefill_moe_hb(M, Ly, T, W.x16, rtop, rw, W.r, W.h, W, t_exp);
+            }
+            g_pf.lap(g_pf.rest);
+            dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
+            continue;
+        }
+#else
         CU(cudaStreamSynchronize(g_s));
         const int* top = W.route_h;
         const float* w = (const float*) (W.route_h + S);
         pop_count(l, top, S);
         g_pf.lap(g_pf.route);
+#endif  // STRATA_USE_HIP
         if (!dump.empty()) {   // the experts picked, [T][K] int32 (compare with the reference's blk.L.picks)
             FILE* f = std::fopen((dump + "/blk." + std::to_string(vis) + ".picks.i32").c_str(), "wb");
             if (f) std::fwrite(top, 4, (size_t) S, f), std::fclose(f);
@@ -5025,6 +5325,9 @@ int main(int argc, char** argv) {
     g_graph = getenv("IK2_GRAPH") ? std::atoi(getenv("IK2_GRAPH")) != 0 : !amd_tuned;
     g_fuse_mask = getenv("IK2_FUSE") && std::atoi(getenv("IK2_FUSE")) ? 0xf : amd_tuned ? 0xf14f : 0;
     if (getenv("IK2_FUSE_MASK")) g_fuse_mask = (int) std::strtol(getenv("IK2_FUSE_MASK"), nullptr, 0);
+    g_hbpf = getenv("IK2_HBPF") ? (int) std::strtol(getenv("IK2_HBPF"), nullptr, 0) : amd_tuned ? 183 : 0;
+    g_hbpf_check = g_hbpf && getenv("IK2_HBPF_CHECK") ? std::atoi(getenv("IK2_HBPF_CHECK")) : 0;
+    g_hbpf_probe = g_hbpf && getenv("IK2_HBPF_PROBE") ? std::atoi(getenv("IK2_HBPF_PROBE")) : 0;
     if (getenv("IK2_AB") && std::atoi(getenv("IK2_AB")) > 0 && g_graph) {
         std::printf("IK2_AB: the launches one by one (IK2_GRAPH=0) - a graph would keep its first arm's kernels\n");
         g_graph = false;
@@ -7453,15 +7756,80 @@ int main(int argc, char** argv) {
         return 0;
     }
     if ((int) prompt.size() + gen > ctx) die("prompt + gen past --ctx");
+#if defined(STRATA_USE_HIP)
+    // IK2_PF_AB="0,1,3,7,15" (IK2_HBPF values; IK2_PF_REPS, 3): before the prompt run below, the prompt's prefill timed
+    // with each value in turn - one load, the arms interleaved, rep 0 a warm-up - a line "pf_ab" each with the first
+    // token's argmax.  Order: rep r starts at arm r (a rotation), odd reps reversed, so an arm meets both neighbours on
+    // both sides and every position (a plain rotation put 0xf always right after 0x7).  Every pass, and
+    // the prompt run after them, starts from zero conv histories (the state a load leaves; the KV slots it reads are
+    // rewritten by the pass): without that a pass started from the previous arm's histories and the first argmax
+    // flipped between reps of one arm.
+    if (getenv("IK2_PF_AB")) {
+        std::vector<int> masks;
+        for (const char* q = getenv("IK2_PF_AB"); *q;) {
+            char* e = nullptr;
+            masks.push_back((int) std::strtol(q, &e, 0));
+            q = *e == ',' ? e + 1 : e;
+            if (e == q && *q) die("IK2_PF_AB: a comma-separated list of IK2_HBPF values");
+        }
+        const int reps = getenv("IK2_PF_REPS") ? std::atoi(getenv("IK2_PF_REPS")) : 3, keep = g_hbpf, P = (int) prompt.size();
+        const int na = (int) masks.size();
+        auto zero_histories = [&]() {   // (as at load: ik2_main.cu "the conv histories start at zero")
+            for (auto& Vi : M.V) {
+                use_dev(M.L[Vi.l].dev);
+                CU(cudaMemset(Vi.h_k, 0, (size_t) 3 * c.KV * c.D * 4));
+                CU(cudaMemset(Vi.h_v, 0, (size_t) 3 * c.KV * c.D * 4));
+                CU(cudaMemset(Vi.h_attn, 0, (size_t) 3 * c.C * 4));
+                CU(cudaMemset(Vi.h_mlp, 0, (size_t) 3 * c.C * 4));
+            }
+            use_dev(M.L[0].dev);
+        };
+        for (int r = 0; r <= reps; ++r)
+            for (int j = 0; j < na; ++j) {
+                g_hbpf = masks[((r & 1 ? na - 1 - j : j) + r) % na];
+                zero_histories();
+                CU(cudaDeviceSynchronize());
+                const double t0 = now();
+                double t_x = 0;
+                int best = -1;
+                for (int p0 = 0, n = 0; p0 < P; p0 += n) {
+                    n = std::min(chunk, P - p0);
+                    std::vector<float> lo;
+                    std::vector<int> ag;
+                    forward(M, prompt.data() + p0, n, p0, false, p0 + n == P ? OutMode::kArgmax : OutMode::kNone,
+                            std::string(), lo, &ag, t_x);
+                    if (!ag.empty()) best = ag[0];
+                }
+                CU(cudaDeviceSynchronize());
+                const double sec = now() - t0;
+                std::printf("pf_ab rep %d IK2_HBPF 0x%x: %d tokens in %.3f s (%.1f tok/s), first argmax %d%s\n", r, g_hbpf, P,
+                            sec, P / sec, best, r ? "" : " (warm-up)");
+                std::fflush(stdout);
+            }
+        g_hbpf = keep;
+        zero_histories();
+    }
+#endif  // STRATA_USE_HIP
     // the prompt
     std::vector<float> logits;
     double t_exp = 0;
     const double tp = now();
+#if defined(STRATA_USE_HIP)
+    // IK2_LOGP_LAST=N with --dump DIR: only the last N positions' log-probabilities (DIR/logprobs.f32 [N][n_vocab]),
+    // the prompt's last N tokens a chunk of their own (no blk.* dumps): a KLD over a long prompt in little RAM
+    const int logp_last = !dump.empty() && getenv("IK2_LOGP_LAST") ? std::atoi(getenv("IK2_LOGP_LAST")) : 0;
+    const bool all = !dump.empty() && !logp_last;
+#else
     const bool all = !dump.empty();
+#endif  // STRATA_USE_HIP
     int first_best = -1;
     const int T_sup = g_dev[0].W.T_sup;
     const int sub_chunk = std::min(g_dev[0].W.Tm, 512);
+#if defined(STRATA_USE_HIP)
+    if (T_sup > 0 && (n_gpu == 1 || dual()) && !drafter && !all && !logp_last && (int) prompt.size() > 64) {
+#else
     if (T_sup > 0 && (n_gpu == 1 || dual()) && !drafter && !all && (int) prompt.size() > 64) {
+#endif  // STRATA_USE_HIP
         BigScratch bs;
         const int T_pass = big_begin(M, g_dev[0].W, dev_cache(0), (int) prompt.size(), (int) prompt.size(), bs);
         if (T_pass != T_sup) std::printf("prefill passes of %d tokens (scratch lent by the expert cache)\n", T_pass);
@@ -7476,6 +7844,18 @@ int main(int argc, char** argv) {
         }
         big_end(g_dev[0].W, dev_cache(0), bs);
     } else {
+#if defined(STRATA_USE_HIP)
+        const int P = (int) prompt.size(), head_end = std::max(0, P - logp_last);
+        for (int p0 = 0, n = 0; p0 < P; p0 += n) {
+            n = std::min(chunk, (logp_last && p0 < head_end ? head_end : P) - p0);
+            const bool last = p0 + n == (int) prompt.size();
+            const bool tail = logp_last && p0 >= head_end;
+            const OutMode om = all || tail ? OutMode::kLogits : (!last ? OutMode::kNone : ((gen > 0 || drafter) ? OutMode::kArgmax : OutMode::kNone));
+            std::vector<float> lo;
+            std::vector<int> ag;
+            forward(M, prompt.data() + p0, n, p0, all || tail, om, all ? dump : std::string(), lo, &ag, t_exp);
+            if (all || tail) logits.insert(logits.end(), lo.begin(), lo.end());
+#else
         for (int p0 = 0; p0 < (int) prompt.size(); p0 += chunk) {
             const int n = std::min(chunk, (int) prompt.size() - p0);
             const bool last = p0 + n == (int) prompt.size();
@@ -7484,6 +7864,7 @@ int main(int argc, char** argv) {
             std::vector<int> ag;
             forward(M, prompt.data() + p0, n, p0, all, om, all ? dump : std::string(), lo, &ag, t_exp);
             if (all) logits.insert(logits.end(), lo.begin(), lo.end());
+#endif  // STRATA_USE_HIP
             else if (last && !ag.empty()) first_best = ag[0];
             if (drafter) {
                 ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, p0);
@@ -7498,11 +7879,21 @@ int main(int argc, char** argv) {
                 (unsigned long long) ec_sum([](ExpertCache& e) { return e.hits; }),
                 (unsigned long long) ec_sum([](ExpertCache& e) { return e.misses; }),
                 ec_sum([](ExpertCache& e) { return e.bytes_up; }) / 1073741824.0);
+#if defined(STRATA_USE_HIP)
+    hb_check_summary();
+    std::fflush(stdout);
+    if (all || logp_last) {
+        // log-probabilities of every prompt position (IK2_LOGP_LAST: of the last N)
+        const size_t np = logits.size() / c.n_vocab;
+        std::vector<float> lp(logits.size());
+        for (size_t t = 0; t < np; ++t) {
+#else
     std::fflush(stdout);
     if (all) {
         // log-probabilities of every prompt position
         std::vector<float> lp(logits.size());
         for (size_t t = 0; t < prompt.size(); ++t) {
+#endif  // STRATA_USE_HIP
             const float* r = logits.data() + t * c.n_vocab;
             double m = -1e30, s = 0;
             for (int v = 0; v < c.n_vocab; ++v) m = std::max(m, (double) r[v]);
@@ -7513,7 +7904,11 @@ int main(int argc, char** argv) {
         FILE* f = std::fopen((dump + "/logprobs.f32").c_str(), "wb");
         std::fwrite(lp.data(), 4, lp.size(), f);
         std::fclose(f);
+#if defined(STRATA_USE_HIP)
+        const float* r_last = logits.data() + (np - 1) * c.n_vocab;
+#else
         const float* r_last = logits.data() + (prompt.size() - 1) * c.n_vocab;
+#endif  // STRATA_USE_HIP
         first_best = (int) (std::max_element(r_last, r_last + c.n_vocab) - r_last);
         logits.clear();
     }

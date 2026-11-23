@@ -99,15 +99,22 @@ static int run(int ty, bool timing) {
             gu_new(d_blob, sg, su, d_h1, st);
             CK(cudaStreamSynchronize(st));
             CK(cudaMemcpy(h1.data(), d_h1, S * F * 2, cudaMemcpyDeviceToHost));
-            int bad = 0; float mx = 0;
+            int bad = 0, nz = 0, nn = 0, first = -1; float mx = 0;   // (nz: +0 vs -0; nn: a NaN, e.g. the 0xFFFF fill = unwritten)
             for (size_t i = 0; i < h0.size(); ++i)
                 if (h0[i] != h1[i]) {
                     ++bad;
+                    if (first < 0) first = (int) i;
                     __half a, b; std::memcpy(&a, &h0[i], 2); std::memcpy(&b, &h1[i], 2);
-                    mx = std::fmax(mx, std::fabs(__half2float(a) - __half2float(b)));
+                    const float fa = __half2float(a), fb = __half2float(b);
+                    nz += fa == 0.0f && fb == 0.0f;
+                    nn += std::isnan(fa) || std::isnan(fb);
+                    mx = std::fmax(mx, std::fabs(fa - fb));
                 }
             std::printf("parity %s gate_up variant %d sg %s: %d / %zu rows differ (max abs %.3g)%s\n", tn, v, sgnull ? "null" : "set", bad,
                         h0.size(), mx, bad ? "  FAIL" : "  bit for bit");
+            if (bad)
+                std::printf("  of them %d +0/-0, %d with a NaN (0xFFFF = not written); first at %d (expert %d, row %d): %04x vs %04x\n",
+                            nz, nn, first, first / F, first % F, h0[first], h1[first]);
             fails += bad != 0;
         }
         // down on h0

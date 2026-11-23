@@ -636,4 +636,45 @@ void attn_slots_f16(const uint16_t* q16, const float* r, int r_ld, const float* 
                     int d_rel, int extent, int window, float* scratch, float* out, const float* gate, int gate_ld,
                     uint16_t* out16, cudaStream_t s);
 
+#if defined(STRATA_USE_HIP)
+/// IK2_HBPF (ik2_hbpf.inc: prefill kernels ported from headbouyJB/inkling2-gufo, MIT): f16 WMMA tiles over the blocks
+/// bit 0: the experts of a chunk grouped on the GPU, gate_up + activation and down as two tiled GEMMs, slots summed
+/// in a fixed order (C 2304, F 1152, E 128, K 8; NVFP4 or Q8_0 experts, all three roles one type: hb_moe_fits)
+struct HbMoeWs {
+    int *cnt, *goff, *fill, *nitems, *item_e, *item_start, *item_n, *postok, *pair;
+    float* posw;
+};
+bool hb_moe_fits(int ty_gate, int ty_up, int ty_down, int C, int F, int E, int K);
+void hb_moe_route(const int* ids, const float* w, int S, int tile, const HbMoeWs& ws, cudaStream_t s);
+/// tab: the experts' blobs (gate rows, up rows, then down at off_down); h16 [T K][F] and pairs [T K][C] scratch; y [T][C];
+/// pipe (bit 6): the GEMMs' late-dequant K step (k_gemm4 PIPE), the same result bit for bit;
+/// probe (with pipe, NVFP4, tile 64): 1 / 2 also launch k_gemm4 without fragment reads / without dequant first (a price
+/// in a kernel trace; their output is overwritten); rg (bit 7): the GEMMs as upstream
+/// gufo's routed kernel shape (k_rg), tile 192 or 128 (the items hb_moe_route made), the same sums as k_gemm4
+void hb_moe_prefill(int type, int tile, const uint8_t* const* tab, size_t off_down, const float* sg, const float* su,
+                    const float* sd, float gcap, float ucap, const uint16_t* x16, uint16_t* h16, float* pairs, float* y,
+                    int T, const HbMoeWs& ws, bool pipe, bool rg, int probe, cudaStream_t s);
+/// bit 1: Y [T][ldy] = X16 [T][K] . W^T over a planar Q8_0 matrix (IK2_DENSE q8: int8 [N][K], F16 d [N][K / 32])
+bool hb_dense_fits(int N, int K);
+void hb_dense(const int8_t* q8, const uint16_t* q8d, int N, int K, const uint16_t* x16, int T, float* Y, int ldy,
+              cudaStream_t s);
+/// bit 2: prefill attention over the FP16 cache (slot = pos % cap) after prep_qkv_r_f16: q16 = to_f16(q) [T][H][D],
+/// r [T][H][d_rel], sink [T][H], rel F32 [extent][d_rel]; out [T][H][D] (the gate not applied)
+bool hb_attn_fits(int H, int KV, int D, int d_rel);
+void hb_attn_prefill(const uint16_t* q16, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
+                     int cap, int T, int pos0, int window, int extent, const float* rel, float qk_scale, float* out,
+                     cudaStream_t s);
+/// bit 4 (ours): up to 3 loop gates over a chunk, each one kernel: y = (1 - tanh(F g)) x + tanh(G g) m with
+/// g = D [rms(x); rms(m)] (eps_gate), then y16 = rms(y) * w (eps_norm) F16, y32 the same F32 when not null; x, m
+/// [T][C] F32 (y32 may be x: a block reads its own rows before it writes them; n 1 then), D [R][2C], F (forget),
+/// G (gain) [R][C]; C 2304, R 64 (hb_ctl_fits)
+struct CtlJob {
+    const float *x, *m, *D, *F, *G, *w;
+    uint16_t* y16;
+    float* y32;
+};
+bool hb_ctl_fits(int C, int R);
+void hb_ctl_prefill(const CtlJob* jobs, int n, int T, float eps_gate, float eps_norm, cudaStream_t s);
+
+#endif  // STRATA_USE_HIP
 }  // namespace ik2::k
