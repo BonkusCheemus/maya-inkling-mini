@@ -6516,6 +6516,168 @@ int main(int argc, char** argv) {
             hist_sig.clear();
             last.clear();
         };
+        // IK2_SLOT_KEEP (8; 0: off): conversations kept in host RAM.  The state above is one conversation's; a request
+        // from another (an agent's side call: a summary, a sub-task, a picture's description) threw it away, and the
+        // next turn of the first read its whole prompt again (10-20 s at 100k tokens).  Now the conversation held is
+        // parked first, at its latest snapshot (the full layers' KV rows before it, the snapshot's conv histories and
+        // sliding windows, the drafter's context), and a request that continues a parked one gets it back in a copy
+        // instead of a read.  The parked take at most half of the RAM free now over a 4 GiB reserve, counting what
+        // they hold (IK2_SLOT_RAM_GB: at most that), and at most IK2_SLOT_KEEP; the least recently used is given up first.
+        struct Park {
+            std::vector<int> ids;                               // the tokens before its point
+            std::vector<uint64_t> sig;                          // their pictures' hashes (as hist_sig: may be shorter)
+            std::vector<std::vector<uint8_t>> h, kv_k, kv_v;    // conv histories [visit * 4 + conv]; K / V [visit]
+            std::vector<uint8_t> draft;                         // the drafter's context caches
+            size_t bytes = 0;
+            uint64_t tick = 0;
+        };
+        std::vector<std::unique_ptr<Park>> parks;
+        const size_t kParkMax = getenv("IK2_SLOT_KEEP") ? (size_t) std::clamp(atoi(getenv("IK2_SLOT_KEEP")), 0, 64) : 8;
+        const bool park_on = kParkMax > 0;
+        const double park_cap_gib = getenv("IK2_SLOT_RAM_GB") ? std::atof(getenv("IK2_SLOT_RAM_GB")) : 0.0;
+        constexpr int kParkLeast = 2048;   // a shorter conversation is read again in about a second
+        constexpr int kParkGain = 1024;    // a parked one comes back when it gives a request this many more tokens
+        uint64_t park_tick = 0;
+        double park_trimmed = -1e9;   // (when the working set was last handed back: see park_live)
+        auto ram_free_now = []() -> double {   // bytes the OS can give now (Windows: RAM and commit both), 0: unknown
+#ifdef _WIN32
+            MEMORYSTATUSEX ms{};
+            ms.dwLength = sizeof(ms);
+            return GlobalMemoryStatusEx(&ms) ? (double) std::min(ms.ullAvailPhys, ms.ullAvailPageFile) : 0.0;
+#else
+            double kb = 0;
+            if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+                char line[256];
+                while (std::fgets(line, sizeof line, f))
+                    if (std::sscanf(line, "MemAvailable: %lf kB", &kb) == 1) break;
+                std::fclose(f);
+            }
+            return kb * 1024;
+#endif
+        };
+        // a's tokens and pictures are where b starts
+        auto starts = [](const std::vector<int>& a, const std::vector<uint64_t>& as, const std::vector<int>& b,
+                         const std::vector<uint64_t>& bs) {
+            if (a.size() > b.size()) return false;
+            for (size_t i = 0; i < a.size(); ++i)
+                if (a[i] != b[i] || (i < as.size() ? as[i] : 0) != (i < bs.size() ? bs[i] : 0)) return false;
+            return true;
+        };
+        auto ring = [&](int v) { return M.L[M.V[v].l].sliding && M.V[v].kv_cap < ctx; };
+        auto park_live = [&](const Snap& sn, const Park* keep) {
+            const double t0 = now(), G = 1073741824.0;
+            const int pos = sn.pos;
+            const size_t row_b = (size_t) KD * kv_elem_b, cc[4] = {KD, KD, C, C};
+            size_t need = drafter ? ik2::draft::context_bytes(drafter, pos) : 0;
+            for (int v = 0; v < (int) M.V.size(); ++v)
+                need += (size_t) 3 * (2 * KD + 2 * C) * 4 + 2 * (size_t) (ring(v) ? std::min(pos, c.window) : pos) * row_b;
+            // (the same conversation parked at an earlier point: this one replaces it)
+            for (size_t i = 0; i < parks.size();)
+                if (parks[i].get() != keep && starts(parks[i]->ids, parks[i]->sig, hist, hist_sig) &&
+                    parks[i]->ids.size() <= (size_t) pos)
+                    parks.erase(parks.begin() + (long) i);
+                else
+                    ++i;
+            size_t held = 0;
+            for (auto& p : parks) held += p->bytes;
+            double free_b = ram_free_now();
+#ifdef _WIN32
+            // The model file's pages stay in the engine's working set after the load, though the weights are in
+            // VRAM, and Windows counts them as taken.  Handed back to its standby list (a page used again comes
+            // back from there) they are free for this - about the model's size.
+            if ((double) need > ((double) held + free_b - 4 * G) / 2 - (double) held && now() - park_trimmed > 60) {
+                park_trimmed = now();
+                SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T) -1, (SIZE_T) -1);
+                free_b = ram_free_now();
+            }
+#endif
+            double room = ((double) held + free_b - 4 * G) / 2;
+            if (park_cap_gib > 0) room = std::min(room, park_cap_gib * G);
+            while (!parks.empty() && ((double) (held + need) > room || parks.size() >= kParkMax)) {
+                int lru = -1;
+                for (int i = 0; i < (int) parks.size(); ++i)
+                    if (parks[i].get() != keep && (lru < 0 || parks[i]->tick < parks[lru]->tick)) lru = i;
+                if (lru < 0) break;
+                held -= parks[lru]->bytes;
+                parks.erase(parks.begin() + lru);
+            }
+            if ((double) (held + need) > room || parks.size() >= kParkMax) {
+                std::fprintf(stderr, "ik2 slots: a conversation of %d tokens not kept (%.2f GiB; room for %.2f GiB)\n", pos,
+                             need / G, std::max(0.0, room - held) / G);
+                return;
+            }
+            auto p = std::make_unique<Park>();
+            try {
+                p->ids.assign(hist.begin(), hist.begin() + pos);
+                p->sig.assign(hist_sig.begin(), hist_sig.begin() + (long) std::min(hist_sig.size(), (size_t) pos));
+                p->h.resize(M.V.size() * 4);
+                p->kv_k.resize(M.V.size());
+                p->kv_v.resize(M.V.size());
+                for (int v = 0; v < (int) M.V.size(); ++v) {
+                    Layer& Ly = bind_visit(M, v);
+                    use_dev(Ly.dev);
+                    for (int i = 0; i < 4; ++i) {
+                        p->h[v * 4 + i].resize(3 * cc[i] * 4);
+                        CU(cudaMemcpyAsync(p->h[v * 4 + i].data(), sn.h[v * 4 + i], 3 * cc[i] * 4, cudaMemcpyDeviceToHost, g_s));
+                    }
+                    if (ring(v)) {   // (the snapshot's window, in host RAM already)
+                        const size_t n = (size_t) std::min(pos, c.window) * row_b;
+                        p->kv_k[v].assign(sn.kv_k[v].begin(), sn.kv_k[v].begin() + (long) n);
+                        p->kv_v[v].assign(sn.kv_v[v].begin(), sn.kv_v[v].begin() + (long) n);
+                    } else {         // (the rows of positions 0 .. pos - 1)
+                        const size_t n = (size_t) pos * row_b;
+                        p->kv_k[v].resize(n);
+                        p->kv_v[v].resize(n);
+                        CU(cudaMemcpyAsync(p->kv_k[v].data(), g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, n, cudaMemcpyDefault, g_s));
+                        CU(cudaMemcpyAsync(p->kv_v[v].data(), g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, n, cudaMemcpyDefault, g_s));
+                    }
+                }
+                for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
+                if (drafter) {
+                    p->draft.resize(ik2::draft::context_bytes(drafter, pos));
+                    ik2::draft::save_context(drafter, pos, p->draft.data());
+                }
+            } catch (const std::bad_alloc&) {
+                std::fprintf(stderr, "ik2 slots: a conversation of %d tokens not kept (no RAM for %.2f GiB)\n", pos, need / G);
+                return;
+            }
+            p->bytes = need;
+            p->tick = ++park_tick;
+            parks.push_back(std::move(p));
+            std::fprintf(stderr, "ik2 slots: kept a conversation of %d tokens (%.2f GiB) in %.0f ms; %zu kept, %.2f GiB\n",
+                         pos, need / G, (now() - t0) * 1e3, parks.size(), (held + need) / G);
+        };
+        auto park_restore = [&](Park& p) {
+            const double t0 = now();
+            const int pos = (int) p.ids.size();
+            const size_t row_b = (size_t) KD * kv_elem_b, cc[4] = {KD, KD, C, C};
+            for (auto& sn : snaps) sn.pos = -1;   // (they were the other conversation's)
+            Snap& sn = snaps[snap_next];
+            snap_next = (snap_next + 1) % (int) snaps.size();
+            for (int v = 0; v < (int) M.V.size(); ++v) {
+                Layer& Ly = bind_visit(M, v);
+                use_dev(Ly.dev);
+                for (int i = 0; i < 4; ++i)
+                    CU(cudaMemcpyAsync(sn.h[v * 4 + i], p.h[v * 4 + i].data(), 3 * cc[i] * 4, cudaMemcpyHostToDevice, g_s));
+                if (ring(v)) {
+                    std::copy(p.kv_k[v].begin(), p.kv_k[v].end(), sn.kv_k[v].begin());
+                    std::copy(p.kv_v[v].begin(), p.kv_v[v].end(), sn.kv_v[v].begin());
+                } else {
+                    const size_t n = (size_t) pos * row_b;
+                    CU(cudaMemcpyAsync(g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, p.kv_k[v].data(), n, cudaMemcpyDefault, g_s));
+                    CU(cudaMemcpyAsync(g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, p.kv_v[v].data(), n, cudaMemcpyDefault, g_s));
+                }
+            }
+            for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
+            sn.pos = pos;
+            snap_copy(sn, false);   // (the conv histories and sliding windows into the visits; the snapshot stays)
+            if (drafter && !p.draft.empty()) ik2::draft::load_context(drafter, pos, p.draft.data());
+            hist = p.ids;
+            hist_sig = p.sig;
+            last.clear();
+            p.tick = ++park_tick;
+            std::fprintf(stderr, "ik2 slots: back to a conversation of %d tokens in %.0f ms\n", pos, (now() - t0) * 1e3);
+        };
         auto parse_ints = [](const std::string& t) {
             std::vector<int> v;
             for (const char* p = t.c_str(); *p;) {
@@ -6656,6 +6818,27 @@ int main(int argc, char** argv) {
             size_t L = 0;   // (a picture's position is the same only with the same rows: its hash beside its token)
             auto hsig = [&](size_t i) { return i < hist_sig.size() ? hist_sig[i] : (uint64_t) 0; };
             while (L < hist.size() && L < ids.size() && hist[L] == ids[L] && hsig(L) == sig[L]) ++L;
+            if (park_on && (hist.size() >= (size_t) kParkLeast || !parks.empty())) {
+                int live = 0;   // what the state held gives this request (as below: L, or a snapshot at or before it)
+                if (L == hist.size() && (L < ids.size() || !last.empty())) live = (int) L;
+                else
+                    for (auto& sn : snaps)
+                        if (sn.pos >= 0 && sn.pos <= (int) L && sn.pos < (int) ids.size()) live = std::max(live, sn.pos);
+                int top = -1;   // the held conversation's latest snapshot: what parking it keeps
+                for (int i = 0; i < (int) snaps.size(); ++i)
+                    if (snaps[i].pos >= 0 && (top < 0 || snaps[i].pos > snaps[top].pos)) top = i;
+                Park* back = nullptr;   // the parked conversation this request goes on from the furthest
+                for (auto& p : parks)
+                    if (p->ids.size() < ids.size() && (int) p->ids.size() > live + kParkGain &&
+                        (!back || p->ids.size() > back->ids.size()) && starts(p->ids, p->sig, ids, sig))
+                        back = p.get();
+                if (top >= 0 && snaps[top].pos >= kParkLeast && snaps[top].pos > live + kParkGain)
+                    park_live(snaps[top], back);
+                if (back) {
+                    park_restore(*back);
+                    L = hist.size();
+                }
+            }
             if (L < hist.size() || L == ids.size()) {
                 // back to the latest snapshot at or before L that leaves a token to run (one past it is dropped:
                 // its position's state follows from a prefix the request does not share)
