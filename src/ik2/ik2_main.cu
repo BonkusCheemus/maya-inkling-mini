@@ -3044,6 +3044,7 @@ bool amd_tuned_device(int n_gpu) {
     return std::strncmp(pr.gcnArchName, "gfx1151", 7) == 0;
 }
 bool g_block = true;       // IK2_BLOCK=0: a verify window through forward() instead of the block path
+int g_dsc = 0;              // IK2_DSC (dsc lane): 1 the exact verify window (the block path), 2 the drafter's head as Q8_0
 #else
 bool g_block = true;        // IK2_BLOCK=0: a verify window through forward() instead of the block path
 #endif  // STRATA_USE_HIP
@@ -3168,6 +3169,24 @@ __global__ void stage_selected_experts(const uint8_t* const* table, const uint8_
         selected[slot] = (const uint8_t*)dst;
 }
 
+#if defined(STRATA_USE_HIP)
+// The parity probe's records (IK2_DSC_PARITY, dsc lane): while on, each visit's MoE input (W.xq), router logits and
+// picks of each row are copied here - set 0 the window's rows, set 1 the decode's tokens: [2][n_visit][8][C | E | K]
+struct DscLog {
+    bool on = false;
+    int set = 0, row = 0;
+    float *xq = nullptr, *rlog = nullptr;
+    int* top = nullptr;
+};
+DscLog g_dlog;
+void dsc_log(const Config& c, int vis, int row, int T, const float* xq, const float* rlog, const int* top) {
+    const size_t v = ((size_t) g_dlog.set * c.n_visit + vis) * 8 + row;
+    CU(cudaMemcpyAsync(g_dlog.xq + v * c.C, xq, (size_t) T * c.C * 4, cudaMemcpyDeviceToDevice, g_s));
+    CU(cudaMemcpyAsync(g_dlog.rlog + v * c.E, rlog, (size_t) T * c.E * 4, cudaMemcpyDeviceToDevice, g_s));
+    CU(cudaMemcpyAsync(g_dlog.top + v * c.K, top, (size_t) T * c.K * 4, cudaMemcpyDeviceToDevice, g_s));
+}
+
+#endif  // STRATA_USE_HIP
 void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
     const Config& c = M.c;
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel;
@@ -3537,6 +3556,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
                            Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
                            fast_gate ? W.gu32 : nullptr, q8_gate, exp_tc ? (uint16_t*) W.gu32 : nullptr);
         }
+        if (g_dlog.on) dsc_log(c, vis, g_dlog.row, 1, W.xq, W.rlog, rtop);   // (the parity probe only: no graph then)
 #else
         k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
                        Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
@@ -3767,18 +3787,40 @@ void block_init(Model& M) {
     g_blk.ready = true;
 }
 
+#if defined(STRATA_USE_HIP)
+// rows [r0, r0 + n) of a planar Q8_0 matrix times x32 [T] (F32 rows x_ld apart): y [T][ldy].  dsc 1a: mv_q8p_rows,
+// each token's sums the decode's mv_q8p (Maya's q8_tile took FP16 inputs on the tensor cores: other sums)
+void tile_rows(const Mat& m, int r0, int n, const float* x32, int x_ld, int T, float* y, int ldy,
+               const k::MvAlt& a0 = k::MvAlt{}, const k::MvAlt& a1 = k::MvAlt{}) {
+    if (!m.q8) die("the block path: a dense matrix that is not planar Q8_0");
+    k::mv_q8p_rows(m.q8 + (size_t) r0 * m.K, m.q8d + (size_t) r0 * (m.K >> 5), n, m.K, x32, x_ld, T, y, ldy, g_s, a0,
+                   a1);
+}
+
+// The exact window (IK2_DSC=1, dsc lane): fast_token_launches' arithmetic for T tokens - every row the float bits the
+// decode gives its token (the parity probe IK2_DSC_PARITY checks it).  The small kernels take T rows with the decode's
+// per-row sums (audited: rms, attn_res*, loop gates, conv_block = mv_conv_row, mv_f16_rows, prep, route_rows,
+// moe_combine_f32, argmax_rows); the dense products mv_q8p_rows over the F32 inputs (1a); the attention each row
+// split as the decode splits one token (1c); the experts the decode's tiles over the window's picks sorted by expert
+// (1b, lazy: an expert's repeat reads from L2).  FP16 KV only.  No graph (on gfx1151 one saves nothing).
+#else
 // rows [r0, r0 + n) of a planar Q8_0 matrix times x16 [T][K] (FP16): y [T][ldy] (the tensor cores, q8_tile)
 void tile_rows(const Mat& m, int r0, int n, const uint16_t* x16, int T, float* y, int ldy) {
     if (!m.q8) die("the block path: a dense matrix that is not planar Q8_0");
     k::q8_tile(m.q8 + (size_t) r0 * m.K, m.q8d + (size_t) r0 * (m.K >> 5), n, m.K, x16, T, y, ldy, g_s);
 }
 
+#endif  // STRATA_USE_HIP
 void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 0) {
     const Config& c = M.c;
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel, S = T * c.K;
     const size_t TC = (size_t) T * C, TCb = TC * 4;
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
+#if defined(STRATA_USE_HIP)
+    const int P_sl = std::min(128, std::max(1, (c.window + 63) / 64)), P_full = 128;   // (fast_token_launches')
+#else
     const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f, v_scale = 32.0f;
+#endif  // STRATA_USE_HIP
     CU(cudaMemcpyAsync(W.tmp, g_blk.emb_h, TCb, cudaMemcpyHostToDevice, g_s));
     k::rms(W.tmp, M.embd_norm, T, C, c.eps, W.h, g_s);
     CU(cudaMemcpyAsync(W.pos, g_blk.pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, g_s));
@@ -3838,12 +3880,24 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 
                 for (int j = 0; j < (sep ? 3 : 1); ++j) k::rms_f16(W.h, nw[j], T, C, c.eps, y16[j], x3[j], g_s);
             }
         }
+#if defined(STRATA_USE_HIP)
+        // the projections over the F32 inputs (mv_q8p's sums a row), the k and v short convs recorded
+        float *q_p, *r_p, *gate_p;
+        int ld;
+#else
         // the projections (the tensor cores), the k and v short convs (their histories and inputs recorded)
         float *q_p, *r_p, *gate_p;
         int q_ld, r_ld, gate_ld;
+#endif  // STRATA_USE_HIP
         if (Ly.sliding) {
             const Mat& m = Ly.wqkvrg;   // q | k | v | r | gate
             const int N = m.N;
+#if defined(STRATA_USE_HIP)
+            if (!sep) tile_rows(m, 0, N, W.xq, C, T, W.qkv, N);
+            else tile_rows(m, 0, N, W.xq, C, T, W.qkv, N, k::MvAlt{W.xk, HD, KD}, k::MvAlt{W.xv, HD + KD, KD});
+            q_p = W.qkv, r_p = W.qkv + HD + 2 * KD, gate_p = r_p + HR;
+            ld = N;
+#else
             if (!sep) {
                 tile_rows(m, 0, N, W.x16, T, W.qkv, N);
             } else {
@@ -3854,6 +3908,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 
             }
             q_p = W.qkv, r_p = W.qkv + HD + 2 * KD, gate_p = r_p + HR;
             q_ld = r_ld = gate_ld = N;
+#endif  // STRATA_USE_HIP
             k::conv_block(W.qkv + HD, N, Ly.h_k, Ly.sc_k, nullptr, 0, 0, T, KD, nullptr, 0, W.kconv, KD, Ly.rec_old[0],
                           Ly.rec_x[0], g_s);
             k::conv_block(W.qkv + HD + KD, N, Ly.h_v, Ly.sc_v, nullptr, 0, 0, T, KD, nullptr, 0, W.vconv, KD,
@@ -3861,20 +3916,49 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 
         } else {
             const Mat& m = Ly.wqrg;     // q | r | gate
             const int N = m.N;
+#if defined(STRATA_USE_HIP)
+            tile_rows(m, 0, N, W.xq, C, T, W.qkv, N);
+            q_p = W.qkv, r_p = W.qkv + HD, gate_p = r_p + HR;
+            ld = N;
+#else
             tile_rows(m, 0, N, W.x16, T, W.qkv, N);
             q_p = W.qkv, r_p = W.qkv + HD, gate_p = r_p + HR;
             q_ld = r_ld = gate_ld = N;
+#endif  // STRATA_USE_HIP
             const int DL = c.KV * 4;
             float *kd = W.dyn, *vd = W.dyn + (size_t) T * DL;
             k::mv_f16_rows(Ly.sc_k_dyn16, DL, C, W.xk, C, T, kd, DL, g_s);
             k::mv_f16_rows(Ly.sc_v_dyn16, DL, C, W.xv, C, T, vd, DL, g_s);
+#if defined(STRATA_USE_HIP)
+            tile_rows(Ly.wk, 0, KD, W.xk, C, T, W.kk, KD);
+            tile_rows(Ly.wv, 0, KD, W.xv, C, T, W.vv, KD);
+#else
             tile_rows(Ly.wk, 0, KD, W.xk16, T, W.kk, KD);
             tile_rows(Ly.wv, 0, KD, W.xv16, T, W.vv, KD);
+#endif  // STRATA_USE_HIP
             k::conv_block(W.kk, KD, Ly.h_k, Ly.sc_k, kd, DL, c.KV, T, KD, nullptr, 0, W.kconv, KD, Ly.rec_old[0],
                           Ly.rec_x[0], g_s);
             k::conv_block(W.vv, KD, Ly.h_v, Ly.sc_v, vd, DL, c.KV, T, KD, nullptr, 0, W.vconv, KD, Ly.rec_old[1],
                           Ly.rec_x[1], g_s);
         }
+#if defined(STRATA_USE_HIP)
+        // the clips, the window's K and V into the cache at its positions (prep: q_ld % 4 == 0 keeps l2clip's vec4
+        // sums a row), then each query's attention as the decode's and the gate
+        const int extent = Ly.sliding ? c.extent_swa : c.extent;
+        const int window = Ly.sliding ? c.window : (1 << 30);
+        if (ld % 4) die("the exact window: a fused projection of rows not a multiple of 4");
+        k::prep_qkv_r_f16_block(q_p, ld, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, ld, Ly.r_clip, T, c.H, c.KV,
+                                c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor,
+                                Ly.kv_cap, nullptr, g_s, Ly.sink16, W.xq, C, W.sink);   // (no q16: the decode's call)
+        k::attn_rows_f16(q_p, ld, r_p, ld, W.sink, Ly.kc, Ly.vc, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, T,
+                         Ly.sliding ? P_sl : P_full, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, gate_p, ld,
+                         W.o, HD, g_s);
+        // the output projection over the gated F32 output and its short conv (the stream added, but where a block
+        // starts)
+        const bool first = l % c.block == 0;
+        if (first) CU(cudaMemcpyAsync(blk(nb), W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
+        tile_rows(Ly.wo, 0, C, W.o, HD, T, W.tmp, C);
+#else
         // the clips, the window's K and V into the cache at its positions, the attention of its queries
         const int extent = Ly.sliding ? c.extent_swa : c.extent;
         const int window = Ly.sliding ? c.window : (1 << 30);
@@ -3901,10 +3985,15 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 
         const bool first = l % c.block == 0;
         if (first) CU(cudaMemcpyAsync(blk(nb), W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
         tile_rows(Ly.wo, 0, C, W.x16, T, W.tmp, C);
+#endif  // STRATA_USE_HIP
         k::conv_block(W.tmp, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, 0, T, C, first ? nullptr : W.h, C, W.r, C,
                       Ly.rec_old[2], Ly.rec_x[2], g_s);
         if (first) ++nb;
+#if defined(STRATA_USE_HIP)
+        // the MoE: its input, the router, the picks as slots sorted by expert, the experts
+#else
         // the MoE: its input, the router, the picks grouped by expert on the device, the experts
+#endif  // STRATA_USE_HIP
         {
             k::ResStates st{};
             for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
@@ -3925,6 +4014,20 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         k::route_rows(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
+#if defined(STRATA_USE_HIP)
+        if (g_dlog.on) dsc_log(c, vis, 0, T, W.xq, W.rlog, rtop);
+        k::dsc_slots(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], g_blk.blob, g_blk.tok,
+                     g_blk.inv, g_blk.sg, g_blk.su, g_blk.wt, g_s);
+        if (k::experts_nv_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {   // (set 16's tiles)
+            k::experts_rows_nv(g_blk.blob, g_blk.tok, S, Ly.eb[0], Ly.eb[0] + Ly.eb[1], W.xq, C, c.F, g_blk.sg,
+                               g_blk.su, c.gate_cap, c.up_cap, W.h16, W.y32, g_s);
+        } else if (Ly.ty[0] == Ly.ty[1] && k::experts_q8_fits(Ly.ty[0], C, c.F) && k::experts_q8_fits(Ly.ty[2], C, c.F)) {
+            k::experts_gate_up_swiglu_q8(g_blk.blob, g_blk.tok, S, Ly.eb[0], W.xq, C, c.F, g_blk.sg, g_blk.su,
+                                         c.gate_cap, c.up_cap, W.h16, g_s);   // (set 15's)
+            k::experts_down_q8(g_blk.blob, S, Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+        } else {
+            die("the exact window: experts that are neither NVFP4 nor Q8_0 at C 2304, F 1152");
+#else
         k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], g_blk.blob, g_blk.n,
                        g_blk.tok, g_blk.row, g_blk.sg, g_blk.su, g_blk.wt, g_blk.inv, g_s);
         if (k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {
@@ -3944,13 +4047,18 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 
                                         C, c.F, g_blk.sg, g_blk.su, c.gate_cap, c.up_cap, W.h16, g_s);
             k::experts_down_g(g_blk.blob, g_blk.n, g_blk.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
                               g_s);
+#endif  // STRATA_USE_HIP
         }
         k::moe_combine_f32(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, W.tmp, false, g_s);
         k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, W.r, C, W.h, C, Ly.rec_old[3], Ly.rec_x[3],
                       g_s);
     }
     if (out_mode == OutMode::kNone) return;
+#if defined(STRATA_USE_HIP)
+    {   // the head: every token's logits (mv_q8p_rows over the F32 input, as mv1's)
+#else
     {   // the head: every token's logits
+#endif  // STRATA_USE_HIP
         k::ResStates st{};
         for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
         st.st[nb] = W.h;
@@ -3959,7 +4067,11 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int slot = 
         k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
         if (g_taps)
             CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, TCb, cudaMemcpyDeviceToDevice, g_s));
+#if defined(STRATA_USE_HIP)
+        tile_rows(M.out_w, 0, c.n_rows, W.xq, C, T, W.logits, c.n_rows);
+#else
         tile_rows(M.out_w, 0, c.n_rows, W.x16, T, W.logits, c.n_rows);
+#endif  // STRATA_USE_HIP
         if (out_mode == OutMode::kArgmax) {
             k::argmax_rows(W.logits, c.n_rows, T, c.n_vocab, W.argmax_d, g_s);
             CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) T * 4, cudaMemcpyDeviceToHost, g_s));
@@ -3995,6 +4107,9 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
         k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, c.C, g_blk.emb_h + (size_t) t * c.C);
         g_blk.pos_h[t] = pos0 + t;
     }
+#if defined(STRATA_USE_HIP)
+    fast_block_launches(M, W, T, out_mode);   // (HIP: no graph a window - a launch probe: one saves nothing here)
+#else
     if (!g_graph) {
         fast_block_launches(M, W, T, out_mode, slot);
     } else {
@@ -4017,6 +4132,7 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
         }
         CU(cudaGraphLaunch(G.exec, g_s));
     }
+#endif  // STRATA_USE_HIP
     CU(cudaStreamSynchronize(g_s));
     if (out_mode == OutMode::kArgmax) {
         argmax_out->assign(W.argmax_h, W.argmax_h + T);
@@ -4344,7 +4460,11 @@ int sample_from(const std::vector<std::pair<int, double>>& d, std::mt19937_64& r
 struct SpecCtl {
     int wmax = 5;
     bool adapt = true;
+#if defined(STRATA_USE_HIP)
+    double c_plain = 21.6e-3, c[kBlockMax + 1] = {};
+#else
     double c_plain = 7.8e-3, c[kBlockMax + 1] = {};
+#endif  // STRATA_USE_HIP
     double S = 1, F = 1;   // (the drafts accepted, the ones rejected: decayed counts)
     int plain_run = 0;
     int probe = getenv("IK2_DRAFT_PROBE") ? atoi(getenv("IK2_DRAFT_PROBE")) : 8;   // plain tokens before a look
@@ -4353,7 +4473,14 @@ struct SpecCtl {
     uint64_t steps = 0, plain = 0, drafted = 0, accepted = 0;
     uint64_t hist[kBlockMax] = {};
     SpecCtl() {
+#if defined(STRATA_USE_HIP)
+        // (gfx1151, the exact window: a plain token 21.6 ms measured (0xf14f); a step = draft + verify of b DERIVED by
+        //  notes/costmodel.py (dense + head once, experts' union, Q8 drafter head) - Maya's were a 3090's; the
+        //  measured times replace them within a few steps)
+        const double prior[kBlockMax + 1] = {0, 21.6e-3, 33.0e-3, 37.1e-3, 41.3e-3, 44.4e-3, 47.5e-3, 50.6e-3, 53.7e-3};
+#else
         const double prior[kBlockMax + 1] = {0, 7.8e-3, 13.3e-3, 15.1e-3, 16.7e-3, 18.2e-3, 19.8e-3, 21.3e-3, 22.8e-3};
+#endif  // STRATA_USE_HIP
         for (int b = 0; b <= kBlockMax; ++b) c[b] = prior[b];
     }
     int choose(int room) {   // room: the widest a step may be (1: plain)
@@ -4386,6 +4513,71 @@ struct SpecCtl {
 // verified as one window.  next: the tokens chosen after the anchor - the accepted drafts and the target's own next
 // token (the last: not run yet, the next step's anchor), cut after a stop token.  The anchor and next but its last
 // are then in the cache, the convs' histories taken back to them and the drafter's context written for them.
+#if defined(STRATA_USE_HIP)
+uint16_t* g_draft_head = nullptr;   // the drafter's FP16 head copy (a Q8_0 target head: dsc piece 0), for propose()
+
+// IK2_DSC_PARITY=n (dsc lane): the first n windows also go the decode's way - the T tokens one at a time through
+// fast_token, no graph - and the two are compared bit for bit: every row's logits (softcapped: kLogits), and each
+// visit's MoE input, router logits and picks.  IDENTICAL: the same bits everywhere.  The convs go back with the
+// window's records after each run; the window then runs again for real (the cache rows rewritten).
+void dsc_parity(Model& M, const int* tk, int T, int P) {
+    const Config& c = M.c;
+    const size_t nv = (size_t) 2 * c.n_visit * 8;
+    if (!g_dlog.xq)
+        g_dlog.xq = dalloc<float>(nv * c.C), g_dlog.rlog = dalloc<float>(nv * c.E), g_dlog.top = dalloc<int>(nv * c.K);
+    std::vector<float> la, lb;
+    g_dlog.on = true, g_dlog.set = 0;
+    fast_block(M, tk, T, P, OutMode::kLogits, la, nullptr);
+    block_rollback(0);
+    const bool gr = g_graph;
+    g_graph = false, g_dlog.set = 1;
+    for (int t = 0; t < T; ++t) {
+        g_dlog.row = t;
+        fast_token(M, tk[t], P + t, OutMode::kLogits, lb, nullptr);
+    }
+    g_graph = gr, g_dlog.on = false;
+    block_rollback(0);
+    CU(cudaStreamSynchronize(g_s));
+    std::vector<float> xq(nv * c.C), rl(nv * c.E);
+    std::vector<int> tp(nv * c.K);
+    CU(cudaMemcpy(xq.data(), g_dlog.xq, xq.size() * 4, cudaMemcpyDeviceToHost));
+    CU(cudaMemcpy(rl.data(), g_dlog.rlog, rl.size() * 4, cudaMemcpyDeviceToHost));
+    CU(cudaMemcpy(tp.data(), g_dlog.top, tp.size() * 4, cudaMemcpyDeviceToHost));
+    auto diff = [](const float* a, const float* b, size_t n, double& mx) {   // differing bits: their count
+        size_t d = 0;
+        for (size_t i = 0; i < n; ++i)
+            if (std::memcmp(a + i, b + i, 4)) ++d, mx = std::max(mx, (double) std::fabs(a[i] - b[i]));
+        return d;
+    };
+    double dl = 0, dx = 0, dr = 0;
+    const size_t nl = diff(la.data(), lb.data(), std::min(la.size(), lb.size()), dl);
+    int am = 0;
+    for (int t = 0; t < T; ++t) {
+        const float *a = la.data() + (size_t) t * c.n_vocab, *b = lb.data() + (size_t) t * c.n_vocab;
+        am += (std::max_element(a, a + c.n_vocab) - a) != (std::max_element(b, b + c.n_vocab) - b);
+    }
+    size_t nx = 0, nr = 0;
+    int np = 0, fv = -1, ft = -1;
+    for (int v = 0; v < c.n_visit; ++v)
+        for (int t = 0; t < T; ++t) {
+            const size_t a = (size_t) v * 8 + t, b = ((size_t) c.n_visit + v) * 8 + t;
+            const size_t x = diff(xq.data() + a * c.C, xq.data() + b * c.C, c.C, dx);
+            const size_t r = diff(rl.data() + a * c.E, rl.data() + b * c.E, c.E, dr);
+            const bool p = std::memcmp(tp.data() + a * c.K, tp.data() + b * c.K, (size_t) c.K * 4) != 0;
+            nx += x, nr += r, np += p;
+            if ((x || r || p) && fv < 0) fv = v, ft = t;
+        }
+    const bool same = la.size() == lb.size() && !nl && !nx && !nr && !np;
+    char where[80];
+    if (fv >= 0) std::snprintf(where, sizeof where, "visit %d row %d", fv, ft);
+    else std::snprintf(where, sizeof where, nl ? "after the last MoE input (last experts, combine, head)" : "none");
+    std::printf("dsc parity: window of %d at %d vs the decode token by token: logits %zu values differ (max |dlogit| "
+                "%.3g, argmax differs in %d of %d rows); MoE inputs %zu (max %.3g), router logits %zu (max %.3g), "
+                "picks differ at %d (visit, row); first difference %s: %s\n",
+                T, P, nl, dl, am, T, nx, dx, nr, dr, np, where, same ? "IDENTICAL" : "DIFFER");
+    std::fflush(stdout);
+}
+#endif  // STRATA_USE_HIP
 void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B, const SampleCfg& sc,
                const std::vector<int>& stops, std::vector<int>& next, int slot = 0) {
     const Config& c = M.c;
@@ -4393,10 +4585,18 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
     if (!raw) raw = dalloc<float>(c.C), anchor_h = dalloc<float>(c.C);
     embed_row(M, anchor, raw, anchor_h);
     int dr[kBlockMax];
+#if defined(STRATA_USE_HIP)
+    ik2::draft::propose(drafter, anchor, anchor_h, P, g_draft_head, c.n_rows, c.n_vocab, dr, B - 1);
+#else
     ik2::draft::propose(drafter, anchor, anchor_h, P, nullptr, c.n_rows, c.n_vocab, dr, B - 1);
+#endif  // STRATA_USE_HIP
     int tk[kBlockMax];
     tk[0] = anchor;
     for (int j = 1; j < B; ++j) tk[j] = dr[j - 1];
+#if defined(STRATA_USE_HIP)
+    static int parity = getenv("IK2_DSC_PARITY") ? atoi(getenv("IK2_DSC_PARITY")) : 0;
+    if (parity > 0) --parity, dsc_parity(M, tk, B, P);
+#endif  // STRATA_USE_HIP
     next.clear();
     std::vector<float> lo;
     if (sc.temp <= 0) {
@@ -5896,6 +6096,13 @@ int main(int argc, char** argv) {
         if (getenv(v) && std::atoi(getenv(v)))
             die(std::string(v) + "=" + getenv(v) + ": a tensor-core path, compiled out of this HIP build");
     g_attn_mma = 0, g_flash = false, g_block = false;
+    // dsc lane: IK2_DSC bit 1 = the exact verify window (the block path, ik2_dsc.inc's kernels; FP16 KV), bit 2 = the
+    // drafter's base logits through mv_q8p_rows over the Q8_0 head (its FP16 copy freed after the fold); unset: as was
+    g_dsc = getenv("IK2_DSC") ? (int) std::strtol(getenv("IK2_DSC"), nullptr, 0) : 0;
+    if (g_dsc & 1) {
+        if (g_kv_fp8) die("IK2_DSC=1: the exact window reads an FP16 cache (IK2_KV=fp16)");
+        g_block = true;
+    }
     {
         cudaDeviceProp pr{};
         CU(cudaGetDeviceProperties(&pr, 0));
@@ -6503,12 +6710,26 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             die(e.what());
         }
+#if defined(STRATA_USE_HIP)
+        // HIP port (dsc piece 0): Maya hands the drafter the Q8_0 blocks here (set_head_q8) and frees the FP16 copy,
+        // but its base logits then go through k::q8_tile - a tensor-core stub on gfx1151 that aborts the first
+        // propose. So the FP16 copy stays (n_rows x C x 2 B: 201,024 x 2304 = 0.93 GB) and propose() reads it
+        // through hipBLAS; the drafter's own numbers only (acceptance), never the target's.  IK2_DSC bit 2: the
+        // blocks after all, through mv_q8p_rows (F32 rows, 0.49 GB a window read instead of 0.93), the copy freed.
+        CU(cudaStreamSynchronize(g_s));
+        if ((g_dsc & 2) && M.out_w.q8 && draft_head != M.out_w.f16) {
+            ik2::draft::set_head_q8(drafter, M.out_w.q8, M.out_w.q8d);
+#else
         if (M.out_w.q8 && draft_head != M.out_w.f16) {   // (the FP16 copy was the fold's: the base logits from the blocks)
             ik2::draft::set_head_q8(drafter, M.out_w.q8, M.out_w.q8d);
             CU(cudaStreamSynchronize(g_s));
+#endif  // STRATA_USE_HIP
             CU(cudaFree(draft_head));
             draft_head = nullptr;
         }
+#if defined(STRATA_USE_HIP)
+        g_draft_head = draft_head;
+#endif  // STRATA_USE_HIP
         g_taps_ld = std::max(chunk, ik2::draft::kBlock);
         g_taps = dalloc<float>((size_t) (g_final_tap + 1) * g_taps_ld * c.C);
         for (auto& Vi : M.V) {

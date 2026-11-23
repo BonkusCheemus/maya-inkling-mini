@@ -2724,6 +2724,7 @@ Engine flags: `--max-context N` (262144), `--parallel N` (1: up to 8 concurrent 
 | `IK2_HBPF_CHECK`, `IK2_HBPF_PROBE`, `IK2_PF_AB`, `IK2_PF_REPS`, `IK2_LOGP_LAST` | off | AMD only, measurement: a class compared with the old path; prefill timed with several `IK2_HBPF` values in one process; the last N positions' log-probabilities to `--dump` |
 | `IK2_MEMTRIM` | AMD build: `0x17` on gfx1151 (one GPU), else `0` | AMD only, exact: 0x01 the load's bounce ring freed; 0x02 the full layers' K / V backed as the context grows; 0x04 `--serve`'s work set released when idle; 0x08 the page cache dropped (a cold reload); 0x10 snapshot buffers not zero-filled; 0x20 K / V in host cells |
 | `IK2_MEMLOG`, `IK2_MEM_FLOOR_MIB`, `IK2_GTT_CAP_MIB`, `IK2_IDLE_S` | off | AMD only: every allocation itemized; the memory floor and GTT cap the K / V growth respects; the idle seconds before 0x04 releases |
+| `IK2_DSC`, `IK2_DSC_PARITY` | off | AMD only, `--draft`: bit 1 the exact verify window (the block path on this build's own kernels, every row the single-token decode's bits; FP16 KV), 2 the drafter's head over its Q8_0 blocks, 4 the window's x in LDS. `IK2_DSC_PARITY=n`: the first n windows also run token by token and are compared |
 
 ## GLM-5.3 (744B)
 

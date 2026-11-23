@@ -675,6 +675,28 @@ struct CtlJob {
 };
 bool hb_ctl_fits(int C, int R);
 void hb_ctl_prefill(const CtlJob* jobs, int n, int T, float eps_gate, float eps_norm, cudaStream_t s);
+// ---- the exact verify window (ik2_dsc.inc, IK2_DSC=1): every row the single-token decode's float bits
+
+/// mv_q8p for T tokens (1 .. 8): y [t] rows ldy apart = W . x [t] (rows x_ld apart, x_ld % 4 == 0), each token's sums
+/// mv_q8p_kernel's (lane, order, expression, butterfly); a0 / a1 as mv_q8p_conv's (their bounds multiples of 4).
+void mv_q8p_rows(const int8_t* q, const uint16_t* d, int N, int K, const float* x, int x_ld, int T, float* y, int ldy,
+                 cudaStream_t s, const MvAlt& a0 = MvAlt{}, const MvAlt& a1 = MvAlt{});
+/// attn_decode_f16_at + gate_mul_f16 for T queries at pos [T] (device), each split P ways as the decode splits one
+/// token; q / r rows q_ld / r_ld apart, sink [T][H], gate rows gate_ld apart -> out [t] rows o_ld apart (F32, gated).
+/// scratch: T x H x P x 130 floats.
+void attn_rows_f16(const float* q, int q_ld, const float* r, int r_ld, const float* sink, const uint16_t* kc,
+                   const uint16_t* vc, int kv_cap, int H, int Hkv, const int* pos, int T, int P, float qk_scale,
+                   const float* proj, int d_rel, int extent, int window, float* scratch, const float* gate,
+                   int gate_ld, float* out, int o_ld, cudaStream_t s);
+/// route()'s S = T K picks (S <= 64) as slots sorted by (expert, pick): slot tables blob / tok / sg / su by slot,
+/// wt (w times down's scale) and inv (the pick's slot) by pick - moe_combine_f32's.
+void dsc_slots(const int* top, const float* w, int S, int K, const uint8_t* const* tab, const float* sg_t,
+               const float* su_t, const float* sd_t, const uint8_t** blob, int* tok, int* inv, float* sg, float* su,
+               float* wt, cudaStream_t s);
+/// sets 13 + 14 (set 16's tiles) over S slots, the slot the fast grid index: h [S][F], y [S][C] (NVFP4, 2304 / 1152).
+void experts_rows_nv(const uint8_t* const* blob, const int* tok, int S, size_t eb0, size_t off_down, const float* x,
+                     int C, int F, const float* sg, const float* su, float gcap, float ucap, uint16_t* h, float* y,
+                     cudaStream_t s);
 
 #endif  // STRATA_USE_HIP
 }  // namespace ik2::k

@@ -6795,5 +6795,6 @@ void attn_slots_f16(const uint16_t*, const float*, int, const float*, const uint
 #include "ik2_fuse.inc"      // IK2_FUSE_MASK: the resident decode's small kernels, fewer and shorter
 #include "ik2_experts2.inc"  // IK2_FUSE_MASK 0x1000..0x8000: batch-1 expert GEMVs, x in registers
 #include "ik2_hbpf.inc"      // IK2_HBPF: prefill kernels ported from headbouyJB/inkling2-gufo (MIT)
+#include "ik2_dsc.inc"       // IK2_DSC: the exact verify window of --draft
 #endif  // STRATA_USE_HIP
 }  // namespace ik2::k
