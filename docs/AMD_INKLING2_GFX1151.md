@@ -23,7 +23,7 @@ device keeps the plain path unless the settings ask; the prefill kernels (`IK2_H
 | load | (always) pinned bounce ring for the experts' copy-in | yes | the same tokens |
 | fused decode | `IK2_FUSE_MASK=0xf14f`, `IK2_GRAPH=0` | yes, bit for bit | `ik2_fuse_test`, `ik2_experts_test` (memcmp); greedy ids on vs off |
 | prefill | `IK2_HBPF=183` | no (another sum order) | KL divergence vs an fp64 reference, as near as the old path |
-| memory | `IK2_MEMTRIM=0x17` | yes | greedy ids on vs off; GTT peak |
+| memory | `IK2_MEMTRIM=0x13` | yes | greedy ids on vs off; GTT peak |
 | DSpark window | `IK2_DSC` (off) | yes | `IK2_DSC_PARITY`, `ik2_dsc_test` |
 
 ## Measured

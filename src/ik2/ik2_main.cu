@@ -5871,7 +5871,7 @@ int main(int argc, char** argv) {
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
     // (gfx1151: 0x17 - the bounce ring freed, K / V backed as the context grows, the idle work set released, the
     // snapshot buffers not zero-filled)
-    g_memtrim = getenv("IK2_MEMTRIM") ? (int) std::strtol(getenv("IK2_MEMTRIM"), nullptr, 0) : amd_tuned ? 0x17 : 0;
+    g_memtrim = getenv("IK2_MEMTRIM") ? (int) std::strtol(getenv("IK2_MEMTRIM"), nullptr, 0) : amd_tuned ? 0x13 : 0;   // (0x04 off on gfx1151: its work-set zero-fill faulted the GPU at load, 13 of 70 loads)
     g_memlog = getenv("IK2_MEMLOG") && std::atoi(getenv("IK2_MEMLOG"));
     if (g_memtrim) std::printf("IK2_MEMTRIM 0x%x\n", g_memtrim);
 #else
