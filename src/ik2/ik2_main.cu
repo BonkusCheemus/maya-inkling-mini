@@ -125,8 +125,9 @@ namespace k = ik2::k;
 
 [[noreturn]] void die(const std::string& m) {
     std::fprintf(stderr, "maya-ik2: %s\n", m.c_str());
-#if defined(STRATA_USE_HIP)   // (std::exit runs the HIP runtime's teardown, which waited forever on a lock after a
-    std::fflush(nullptr);     //  failed copy in --serve: the server sat in a futex for 24 min, pr_gpu_1124_1533)
+#if defined(STRATA_USE_HIP)   // (not std::exit: in --serve the stdin reader thread waits in getline holding stdin's
+    std::fflush(stdout);      //  lock, and exit()'s flush of every stream waits on it forever (glibc 2.44; the server
+    std::fflush(stderr);      //  sat in a futex 24 min, pr_gpu_1124_1533): flush the streams we write, then leave)
     std::_Exit(1);
 #else
     std::exit(1);
@@ -7936,6 +7937,11 @@ int main(int argc, char** argv) {
                 g_cancel = 0;
             }
         }
+#if defined(STRATA_USE_HIP)   // (QUIT: returning from main runs exit(), whose flush of every stream waits forever on
+        std::fflush(stdout);      //  stdin's lock, held by the detached reader thread in getline (glibc 2.44): flush the
+        std::fflush(stderr);      //  streams we write, then leave, as die() does)
+        std::_Exit(0);
+#endif
         return 0;
     }
 
@@ -8696,6 +8702,11 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             busy = false;
         }
+#if defined(STRATA_USE_HIP)   // (QUIT: returning from main runs exit(), whose flush of every stream waits forever on
+        std::fflush(stdout);      //  stdin's lock, held by the detached reader thread in getline (glibc 2.44): flush the
+        std::fflush(stderr);      //  streams we write, then leave, as die() does)
+        std::_Exit(0);
+#endif
         return 0;
     }
     if ((int) prompt.size() + gen > ctx) die("prompt + gen past --ctx");
