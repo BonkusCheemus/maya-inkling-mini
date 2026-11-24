@@ -8136,8 +8136,13 @@ int main(int argc, char** argv) {
                         const size_t n = (size_t) pos * row_b;
                         p->kv_k[v].resize(n);
                         p->kv_v[v].resize(n);
+#if defined(STRATA_USE_HIP)   // (K / V on demand, memtrim 0x02: the rows are hipMemMap'd; hipMemcpyDefault cannot classify such an address -> 'invalid argument')
+                        CU(cudaMemcpyAsync(p->kv_k[v].data(), g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, n, cudaMemcpyDeviceToHost, g_s));
+                        CU(cudaMemcpyAsync(p->kv_v[v].data(), g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, n, cudaMemcpyDeviceToHost, g_s));
+#else
                         CU(cudaMemcpyAsync(p->kv_k[v].data(), g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, n, cudaMemcpyDefault, g_s));
                         CU(cudaMemcpyAsync(p->kv_v[v].data(), g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, n, cudaMemcpyDefault, g_s));
+#endif  // STRATA_USE_HIP
                     }
                 }
                 for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
@@ -8177,8 +8182,13 @@ int main(int argc, char** argv) {
 #endif  // STRATA_USE_HIP
                 } else {
                     const size_t n = (size_t) pos * row_b;
+#if defined(STRATA_USE_HIP)   // (K / V on demand, memtrim 0x02: the rows are hipMemMap'd; hipMemcpyDefault cannot classify such an address -> 'invalid argument')
+                    CU(cudaMemcpyAsync(g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, p.kv_k[v].data(), n, cudaMemcpyHostToDevice, g_s));
+                    CU(cudaMemcpyAsync(g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, p.kv_v[v].data(), n, cudaMemcpyHostToDevice, g_s));
+#else
                     CU(cudaMemcpyAsync(g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, p.kv_k[v].data(), n, cudaMemcpyDefault, g_s));
                     CU(cudaMemcpyAsync(g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, p.kv_v[v].data(), n, cudaMemcpyDefault, g_s));
+#endif  // STRATA_USE_HIP
                 }
             }
             for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
