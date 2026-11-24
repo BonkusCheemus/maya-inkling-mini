@@ -89,13 +89,13 @@ static int run(int ty, bool timing) {
     for (int sgnull = 0; sgnull < 2; ++sgnull) {
         const float* sg = sgnull ? nullptr : d_sg;
         const float* su = sgnull ? nullptr : d_sg + S;
-        CK(cudaMemset(d_h0, 0xFF, S * F * 2));
+        CK(cudaMemsetAsync(d_h0, 0xFF, S * F * 2, st));   // (on st: a null-stream fill does not order with the non-blocking st and could land after the kernel)
         k::experts_gate_up_swiglu(d_blob, d_tok, S, ty, ty, EB0, d_x, C, F, sg, su, gcap, ucap, d_h0, st);
         CK(cudaStreamSynchronize(st));
         CK(cudaMemcpy(h0.data(), d_h0, S * F * 2, cudaMemcpyDeviceToHost));
         for (int v = 0; v <= nvar; ++v) {
             k::g_exp_gu = v;
-            CK(cudaMemset(d_h1, 0xFF, S * F * 2));
+            CK(cudaMemsetAsync(d_h1, 0xFF, S * F * 2, st));   // (on st: a null-stream fill does not order with the non-blocking st and could land after the kernel)
             gu_new(d_blob, sg, su, d_h1, st);
             CK(cudaStreamSynchronize(st));
             CK(cudaMemcpy(h1.data(), d_h1, S * F * 2, cudaMemcpyDeviceToHost));
@@ -118,13 +118,13 @@ static int run(int ty, bool timing) {
             fails += bad != 0;
         }
         // down on h0
-        CK(cudaMemset(d_y0, 0xFF, S * C * 4));
+        CK(cudaMemsetAsync(d_y0, 0xFF, S * C * 4, st));   // (on st: a null-stream fill does not order with the non-blocking st and could land after the kernel)
         k::experts_down(d_blob, S, ty, EB0 + EB1, d_h0, C, F, d_y0, st);
         CK(cudaStreamSynchronize(st));
         CK(cudaMemcpy(y0.data(), d_y0, S * C * 4, cudaMemcpyDeviceToHost));
         for (int v = 0; v <= nvar; ++v) {
             k::g_exp_dn = v;
-            CK(cudaMemset(d_y1, 0xFF, S * C * 4));
+            CK(cudaMemsetAsync(d_y1, 0xFF, S * C * 4, st));   // (on st: a null-stream fill does not order with the non-blocking st and could land after the kernel)
             dn_new(d_blob, d_h0, d_y1, st);
             CK(cudaStreamSynchronize(st));
             CK(cudaMemcpy(y1.data(), d_y1, S * C * 4, cudaMemcpyDeviceToHost));
