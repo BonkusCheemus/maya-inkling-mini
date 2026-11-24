@@ -3680,6 +3680,15 @@ __global__ void attn_decode_kernel(const float* q, const float* r, const float* 
     }
     out[(size_t) h * 128 + tid] = (o / den) * v_inv_scale;
 }
+#if defined(STRATA_USE_HIP)
+// f2h(a * s) with a -0 product kept -0.  clang for gfx1151 compiles the FP16 of a product as v_fma_mix{lo,hi}_f16
+// a, s, 0, and that FMA's +0 addend makes a -0 product +0 (-0 * s + 0 = +0); CUDA keeps -0 (E4M3FN byte 0x80 unpacks
+// to 0x8000).  Every other product is the same bits (the instruction rounds the FMA to FP32, then to FP16).  The sign
+// of a product is a's sign XOR s's, zero or not: OR it back in.
+__device__ __forceinline__ uint16_t f2h_mul(float a, float s) {
+    return f2h(a * s) | (uint16_t) (((float_to_bits(a) ^ float_to_bits(s)) >> 16) & 0x8000u);
+}
+#endif  // STRATA_USE_HIP
 
 __global__ void unpack_kv_fp8_to_f16_vec4_kernel(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk,
                                                  int KD, float k_inv_scale, float v_inv_scale, uint16_t* k_out16,
@@ -3695,15 +3704,27 @@ __global__ void unpack_kv_fp8_to_f16_vec4_kernel(const uint8_t* kc, const uint8_
             const uint32_t k4 = __ldg((const uint32_t*) (kc + src_off) + d4);
             const float2 f0 = e4m3fnx2_to_f2((uint16_t) (k4 & 0xFFFFu));
             const float2 f1 = e4m3fnx2_to_f2((uint16_t) (k4 >> 16));
+#if defined(STRATA_USE_HIP)
+            ((uint2*) (k_out16 + dst_off))[d4] =
+                make_uint2(f2h_mul(f0.x, k_inv_scale) | (uint32_t) f2h_mul(f0.y, k_inv_scale) << 16,
+                           f2h_mul(f1.x, k_inv_scale) | (uint32_t) f2h_mul(f1.y, k_inv_scale) << 16);
+#else
             ((uint2*) (k_out16 + dst_off))[d4] = make_uint2(f2_to_u32(f0.x * k_inv_scale, f0.y * k_inv_scale),
                                                             f2_to_u32(f1.x * k_inv_scale, f1.y * k_inv_scale));
+#endif  // STRATA_USE_HIP
         }
         if (v_out16) {
             const uint32_t v4 = __ldg((const uint32_t*) (vc + src_off) + d4);
             const float2 f0 = e4m3fnx2_to_f2((uint16_t) (v4 & 0xFFFFu));
             const float2 f1 = e4m3fnx2_to_f2((uint16_t) (v4 >> 16));
+#if defined(STRATA_USE_HIP)
+            ((uint2*) (v_out16 + dst_off))[d4] =
+                make_uint2(f2h_mul(f0.x, v_inv_scale) | (uint32_t) f2h_mul(f0.y, v_inv_scale) << 16,
+                           f2h_mul(f1.x, v_inv_scale) | (uint32_t) f2h_mul(f1.y, v_inv_scale) << 16);
+#else
             ((uint2*) (v_out16 + dst_off))[d4] = make_uint2(f2_to_u32(f0.x * v_inv_scale, f0.y * v_inv_scale),
                                                             f2_to_u32(f1.x * v_inv_scale, f1.y * v_inv_scale));
+#endif  // STRATA_USE_HIP
         }
     }
 }
@@ -3718,8 +3739,13 @@ __global__ void unpack_kv_fp8_to_f16_kernel(const uint8_t* kc, const uint8_t* vc
         const int d = (int) (idx % (size_t) KD);
         const int slot = kv_row_index(k0 + j, kv_cap, page_table);
         const size_t src = (size_t) slot * KD + d;
+#if defined(STRATA_USE_HIP)
+        if (k_out16) k_out16[idx] = f2h_mul(e4m3fn_to_f32(kc[src]), k_inv_scale);
+        if (v_out16) v_out16[idx] = f2h_mul(e4m3fn_to_f32(vc[src]), v_inv_scale);
+#else
         if (k_out16) k_out16[idx] = f2h(e4m3fn_to_f32(kc[src]) * k_inv_scale);
         if (v_out16) v_out16[idx] = f2h(e4m3fn_to_f32(vc[src]) * v_inv_scale);
+#endif  // STRATA_USE_HIP
     }
 }
 
