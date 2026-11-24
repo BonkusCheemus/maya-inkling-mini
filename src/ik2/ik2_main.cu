@@ -125,7 +125,12 @@ namespace k = ik2::k;
 
 [[noreturn]] void die(const std::string& m) {
     std::fprintf(stderr, "maya-ik2: %s\n", m.c_str());
+#if defined(STRATA_USE_HIP)   // (std::exit runs the HIP runtime's teardown, which waited forever on a lock after a
+    std::fflush(nullptr);     //  failed copy in --serve: the server sat in a futex for 24 min, pr_gpu_1124_1533)
+    std::_Exit(1);
+#else
     std::exit(1);
+#endif  // STRATA_USE_HIP
 }
 
 std::string fmt_gib(size_t b) {
@@ -953,6 +958,20 @@ bool kv_ensure(int rows) {
     std::fprintf(stderr, "memtrim 0x02: K / V backed for %d rows (+%.1f MiB; %.1f MiB in %zu arrays, %s) in %.2f ms\n",
                  have, add / 1048576.0, tot / 1048576.0, g_kv_regions.size(), cells ? "cells" : "VMM", (now() - t0) * 1e3);
     return true;
+}
+// a runtime copy of n bytes to or from a K / V array: under 0x02 each chunk is its own reservation (vmm_map), and
+// one hipMemcpy may not cross a reservation ('invalid argument' at the park save once a conversation passed a
+// chunk's rows, pr_gpu_1124_1533) - so the copy goes in pieces that stop at each chunk's end
+void kv_copy(void* dst, const void* src, size_t n, cudaMemcpyKind kind, cudaStream_t s) {
+    const uint8_t* dev = (const uint8_t*) (kind == cudaMemcpyDeviceToHost ? src : dst);
+    const Backed* b = nullptr;
+    for (const auto& r : g_kv_regions)
+        if (dev >= r.b.base && dev < r.b.base + r.b.reserved) b = &r.b;
+    for (size_t o = 0; o < n;) {
+        const size_t m = b ? std::min(n - o, b->chunk - (size_t) (dev + o - b->base) % b->chunk) : n - o;
+        CU(cudaMemcpyAsync((uint8_t*) dst + o, (const uint8_t*) src + o, m, kind, s));
+        o += m;
+    }
 }
 template <class T> T* kv_alloc(size_t n, bool sliding, std::source_location sl = std::source_location::current()) {
     if (!sliding && !g_kv_managed && (g_memtrim & 2))
@@ -8136,9 +8155,9 @@ int main(int argc, char** argv) {
                         const size_t n = (size_t) pos * row_b;
                         p->kv_k[v].resize(n);
                         p->kv_v[v].resize(n);
-#if defined(STRATA_USE_HIP)   // (K / V on demand, memtrim 0x02: the rows are hipMemMap'd; hipMemcpyDefault cannot classify such an address -> 'invalid argument')
-                        CU(cudaMemcpyAsync(p->kv_k[v].data(), g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, n, cudaMemcpyDeviceToHost, g_s));
-                        CU(cudaMemcpyAsync(p->kv_v[v].data(), g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, n, cudaMemcpyDeviceToHost, g_s));
+#if defined(STRATA_USE_HIP)   // (K / V on demand, memtrim 0x02: the rows are hipMemMap'd; one copy may not cross a chunk's reservation: kv_copy)
+                        kv_copy(p->kv_k[v].data(), g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, n, cudaMemcpyDeviceToHost, g_s);
+                        kv_copy(p->kv_v[v].data(), g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, n, cudaMemcpyDeviceToHost, g_s);
 #else
                         CU(cudaMemcpyAsync(p->kv_k[v].data(), g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, n, cudaMemcpyDefault, g_s));
                         CU(cudaMemcpyAsync(p->kv_v[v].data(), g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, n, cudaMemcpyDefault, g_s));
@@ -8182,9 +8201,9 @@ int main(int argc, char** argv) {
 #endif  // STRATA_USE_HIP
                 } else {
                     const size_t n = (size_t) pos * row_b;
-#if defined(STRATA_USE_HIP)   // (K / V on demand, memtrim 0x02: the rows are hipMemMap'd; hipMemcpyDefault cannot classify such an address -> 'invalid argument')
-                    CU(cudaMemcpyAsync(g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, p.kv_k[v].data(), n, cudaMemcpyHostToDevice, g_s));
-                    CU(cudaMemcpyAsync(g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, p.kv_v[v].data(), n, cudaMemcpyHostToDevice, g_s));
+#if defined(STRATA_USE_HIP)   // (K / V on demand, memtrim 0x02: the rows are hipMemMap'd; one copy may not cross a chunk's reservation: kv_copy)
+                    kv_copy(g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, p.kv_k[v].data(), n, cudaMemcpyHostToDevice, g_s);
+                    kv_copy(g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, p.kv_v[v].data(), n, cudaMemcpyHostToDevice, g_s);
 #else
                     CU(cudaMemcpyAsync(g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, p.kv_k[v].data(), n, cudaMemcpyDefault, g_s));
                     CU(cudaMemcpyAsync(g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, p.kv_v[v].data(), n, cudaMemcpyDefault, g_s));
