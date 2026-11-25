@@ -22,9 +22,44 @@ device keeps the plain path unless the settings ask; the prefill kernels (`IK2_H
 | --- | --- | --- | --- |
 | load | (always) pinned bounce ring for the experts' copy-in | yes | the same tokens |
 | fused decode | `IK2_FUSE_MASK=0xf14f`, `IK2_GRAPH=0` | yes, bit for bit | `ik2_fuse_test`, `ik2_experts_test` (memcmp); greedy ids on vs off |
-| prefill | `IK2_HBPF=183` | no (another sum order) | KL divergence vs an fp64 reference, as near as the old path |
+| prefill | `IK2_HBPF=439` (183 + 256; 256 acts only on a turbo6 cache) | no (another sum order) | KL divergence vs an fp64 reference, as near as the old path |
 | memory | `IK2_MEMTRIM=0x13` | yes | greedy ids on vs off; GTT peak |
 | DSpark window | `IK2_DSC` (off) | yes | `IK2_DSC_PARITY`, `ik2_dsc_test` |
+| turbo6 KV | `IK2_KV=turbo6` (off) | no against FP16 KV (lossy); its readers yes against each other | `ik2_kernels_test` (`IK2_TEST_T6=1`: the turbo6 tests alone); KL vs FP16 KV |
+
+## turbo6 KV cache (`IK2_KV=turbo6`)
+
+Off by default. One GPU, AMD build only (the CUDA build refuses the value; so do `--gpus 2`, `IK2_KV_MANAGED` and
+`IK2_DSC` bit 1).
+
+- **Format** (`src/ik2/ik2_turbo6.h`): a 128-value head is one 98-byte block - its L2 norm as FP16, then 6-bit codes
+  (64 bytes of low nibbles, 32 bytes of top 2 bits). The values are divided by their norm and rotated (random signs,
+  the normalized 128-point Walsh-Hadamard transform, signs again); a code picks one of 64 Lloyd-Max centroids of
+  N(0, 1/128). The stored norm is the input's L2 norm over the norm of the centroids picked, so a decoded block keeps
+  the input's norm.
+- **Memory**: the full layers' K / V 32 KB a token in FP16 -> 12.25 KB. Inkling-2-Mini's 262,144 tokens of context
+  need 3.06 GiB of KV instead of 8: with UD-Q4_K_XL (~17.8 GiB of weights and work buffers on the GPU) ~21 GiB in
+  all against ~26, out of the 32 GB the CPU and GPU share.
+- **Kernels** (`src/ik2/ik2_turbo6.inc`): the encoder writes exactly the CPU reference's bytes
+  (`ik2::t6::QuantizeBlock`: the same order of sums, no fused multiply-add); the token's attention reads the codes
+  in its loop (the query rotated once - q.k = (Rq).(Rk) - V summed in the rotated space, the head's output rotated
+  back in the combine); the prompt path decodes a visit's blocks to FP16 rows for its GEMMs, and with `IK2_HBPF` 256
+  runs bit 4's attention kernel over them (in passes when a full visit is longer than the scratch rows).
+- **Exact where it can be**: the three turbo6 tests in `ik2_kernels_test` compare bit for bit - the encoder against the
+  CPU reference, the token reader against the calls it replaces (`IK2_FUSE_MASK` bit 22 keeps the older reader), the
+  prompt-path attention against the FP16 kernel over the CPU-decoded cache, passes against one call.
+- **Quality**: lossy against an FP16 cache. UD-Q4_K_XL, the last 512 positions of three 4096-token texts: KL(FP16 KV
+  || turbo6) 0.008-0.010 nats a position, top-1 the same in 95.3-96.5 % (it grows with depth). HumanEval (164, greedy,
+  thinking off): 142 with turbo6 KV (on UD-IQ4_XS weights), 142 with FP16 KV (UD-Q4_K_XL). FP16 stays the default.
+- **Speed** on gfx1151: prefill 2-3.5 % behind FP16 at 4,096-16,384 tokens (the encode and the FP16 unpack; measured
+  on our standalone HIP build of the same kernels); decode: see Measured.
+
+Credits: the codec is **tubo**'s `src/models/qwen/hip/turbo4_codec.hpp`, its 6-bit path
+(https://github.com/BonkusCheemus/tubo, MIT; tubo is a gufo-based engine, its license is gufo's, below): the tables
+and functions are copied with that file's line numbers in `ik2_turbo6.h`. tubo's turbo6 block and codebooks come
+from **TheTom/llama-cpp-turboquant** PR #381 ("turbo5 and turbo6 KV cache types", JakeATX; MIT, the ggml authors'
+license as in `third_party/ggml/LICENSE`), an implementation of **TurboQuant** (Zandieh, Daliri, Hadian, Mirrokni:
+"TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate", arXiv 2504.19874).
 
 ## Measured
 
@@ -50,6 +85,8 @@ Prefill answers: KL divergence against an fp64 reference (4096-token prompt, las
 - `k_rg` (`IK2_HBPF` bit 7) follows the shape of **gufo**'s routed expert GEMMs (gufo-org/gufo v0.35
   `RoutedDownF16Kernel` / `RoutedPairF16Kernel`, `SwapHalves`), with the NVFP4 type and 192-token tile of
   mikealanni/gufo's `RoutedF16GEMMKernel<kNVFP4>`.
+- `src/ik2/ik2_turbo6.h` / `ik2_turbo6.inc` (`IK2_KV=turbo6`): tubo's codec (MIT), from TheTom/llama-cpp-turboquant
+  PR #381 (MIT), after the TurboQuant paper (arXiv 2504.19874): details in the turbo6 section above.
 - The engine itself is Maya's (and Strata's `hip_compat` layer).
 - Made by Claude (Anthropic) working for Cold-Serve Labs.
 
