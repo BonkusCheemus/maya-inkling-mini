@@ -25,6 +25,9 @@
 #include "ik2_cpu_deep.hpp"
 #include "ik2_draft.hpp"
 #include "ik2_kernels.cuh"
+#if defined(STRATA_USE_HIP)
+#include "ik2_turbo6.h"
+#endif  // STRATA_USE_HIP
 #include "strata/artifact/gguf_reader.hpp"
 
 #include <cublas_v2.h>
@@ -271,6 +274,9 @@ struct Layer {
     // the state: of the visit being run (bind_visit)
     uint16_t *kc = nullptr, *vc = nullptr;         // FP16 [kv_cap][KV * D] (IK2_KV=f16)
     uint8_t *kc8 = nullptr, *vc8 = nullptr;        // FP8 E4M3 [kv_cap][KV * D] (IK2_KV=fp8)
+#if defined(STRATA_USE_HIP)
+    uint8_t *kc6 = nullptr, *vc6 = nullptr;        // turbo6 [kv_cap][KV][98] (IK2_KV=turbo6; ik2_turbo6.h)
+#endif  // STRATA_USE_HIP
     int kv_cap = 0;
     const int* page_table = nullptr;               // device [g_kv_max_pages] for paged global KV (null if unpaged/sliding)
     float *h_k, *h_v, *h_attn, *h_mlp;             // conv histories [3][C']
@@ -293,6 +299,9 @@ struct Visit {
     int pass = 0;     // the core's pass (0: its first, or a layer outside the core)
     uint16_t *kc = nullptr, *vc = nullptr;
     uint8_t *kc8 = nullptr, *vc8 = nullptr;
+#if defined(STRATA_USE_HIP)
+    uint8_t *kc6 = nullptr, *vc6 = nullptr;
+#endif  // STRATA_USE_HIP
     int kv_cap = 0;
     float *h_k = nullptr, *h_v = nullptr, *h_attn = nullptr, *h_mlp = nullptr;
     float *rec_old[4] = {}, *rec_x[4] = {};
@@ -318,6 +327,9 @@ inline Layer& bind_visit(Model& M, int v, int slot = 0) {
     Ly.vc = Vi.vc ? Vi.vc + kv_off : nullptr;
     Ly.kc8 = Vi.kc8 ? Vi.kc8 + kv_off : nullptr;
     Ly.vc8 = Vi.vc8 ? Vi.vc8 + kv_off : nullptr;
+#if defined(STRATA_USE_HIP)
+    Ly.kc6 = Vi.kc6, Ly.vc6 = Vi.vc6;   // (slot > 0 is --parallel > 1's: refused on AMD)
+#endif  // STRATA_USE_HIP
     Ly.kv_cap = Vi.kv_cap;
     Ly.page_table = (!Ly.sliding && g_kv_pt_d) ? (g_kv_pt_d + (size_t) slot * g_kv_max_pages) : nullptr;
     Ly.h_k = Vi.h_k + (size_t) slot * 3 * KD;
@@ -856,6 +868,14 @@ bool g_dense_mv = false;
 // top-1 token (KL mean 8.5e-4) and FP8 changed 5 (KL 8.3e-3): Inkling's router is full of near-ties, so FP8's 1.5% in
 // layer 0's attention output already moves 7 of 48 tokens' experts.  The full layers' cache is 32 KB a token in FP16.
 bool g_kv_fp8 = false;
+#if defined(STRATA_USE_HIP)
+// IK2_KV=turbo6: tubo's 98-byte block a 128-value head (ik2_turbo6.h / .inc), 0.77 bytes a value against FP16's 2
+bool g_kv_t6 = false;
+// a token's K (or its V) row in the cache, in bytes
+inline size_t kv_row_bytes(int KV, int D) {
+    return g_kv_t6 ? (size_t) KV * (D / 128) * ik2::t6::kBlockBytes : (size_t) KV * D * (g_kv_fp8 ? 1 : 2);
+}
+#endif  // STRATA_USE_HIP
 bool g_kv_managed = false;
 bool g_managed_experts = false;
 size_t g_kv_room = 0;
@@ -1213,8 +1233,13 @@ void mv1c(const Mat& m, const float* x, float* y, const k::MvConv& c0, const k::
 // parts straight into their buffers (no unpack; with 2) - 64 (with 1) the expert GEMMs'
 // late-dequant K step (k_gemm4 PIPE, the same sums bit for bit); 128 (with 1) the
 // expert GEMMs in upstream gufo's routed kernel shape (k_rg: 128 rows x 192 / 128 tokens, weights in registers, decoded
-// once a wave; the same sums as k_gemm4) - bit 6 is then unused
+// once a wave; the same sums as k_gemm4) - bit 6 is then unused; 256 (with 4) bit 2's
+// attention over a turbo6 cache too: a visit's keys decoded once to FP16 rows (unpack_kv_t6_to_f16, the old path's
+// values), the FP16 kernel over them, a full visit past the rows in passes (k::hb_attn_prefill_t6)
 int g_hbpf = 0;
+// IK2_T6PF_PASS=N (tests, bit 256): a full visit of more than N keys in passes of N (a multiple of 64, <= the
+// W.kv_tmp_cap rows; else such a visit takes the old path); unset: passes of W.kv_tmp_cap rounded down to 64
+int g_t6pf_pass = 0;
 constexpr int kHbMinT = 64;
 // the experts' token tile (hb_moe_route's items): bit 7's k_rg 192 from 2048 tokens (mikealanni/gufo's Inkling choice:
 // T / 16 picks an expert, one tile holds most), else 128; k_gemm4 64 from 1024 (headbouy's engine.cpp:927), else 32
@@ -2412,7 +2437,15 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         CU(cudaMemPrefetchAsync(g_kv_fp8 ? (void*)Ly.kc8 : (void*)Ly.kc, bytes, Ly.dev, g_s));
         CU(cudaMemPrefetchAsync(g_kv_fp8 ? (void*)Ly.vc8 : (void*)Ly.vc, bytes, Ly.dev, g_s));
     }
+#if defined(STRATA_USE_HIP)
+    if (g_kv_t6) {   // (k, v staged in F32 in place: W.kconv / W.vconv have no reader after this)
+        k::prep_qkv_r_t6(q_p, Ly.q_clip, W.kconv, W.vconv, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel, c.qk_clip,
+                         c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, W.kconv, W.vconv, Ly.kc6,
+                         Ly.vc6, Ly.kv_cap, pos0, nullptr, nullptr, nullptr, nullptr, 0, nullptr, g_s);
+    } else if (g_kv_fp8) {
+#else
     if (g_kv_fp8) {
+#endif  // STRATA_USE_HIP
         k::prep_qkv_r_fp8(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
                           Ly.kv_cap, k_scale, v_scale, g_s, Ly.page_table);
@@ -2430,7 +2463,15 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
     const int attn_kv_cap = Ly.sliding ? Ly.kv_cap : 0;
     if (T == 1) {
+#if defined(STRATA_USE_HIP)
+        if (g_kv_t6) {
+            k::attn_decode_t6(q_p, r_p, sink_p, Ly.kc6, Ly.vc6, attn_kv_cap, 1, c.H, c.KV, k0, nk, pos0, nullptr,
+                              std::min(128, std::max(1, (nk + 63) / 64)), qk_scale, Ly.rel_proj, c.d_rel, extent,
+                              window, W.lg, W.o, g_s);
+        } else if (g_kv_fp8) {
+#else
         if (g_kv_fp8) {
+#endif  // STRATA_USE_HIP
             k::attn_decode_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0,
                                qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s,
                                Ly.page_table);
@@ -2439,7 +2480,15 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s, Ly.page_table);
         }
     } else if (T <= 8 && g_group && g_group_attn) {
+#if defined(STRATA_USE_HIP)
+        if (g_kv_t6) {
+            k::attn_decode_t6(q_p, r_p, sink_p, Ly.kc6, Ly.vc6, attn_kv_cap, T, c.H, c.KV, k0, nk, pos0, nullptr,
+                              std::min(128, std::max(1, (nk + 63) / 64)), qk_scale, Ly.rel_proj, c.d_rel, extent,
+                              window, W.lg, W.o, g_s);
+        } else if (g_kv_fp8) {
+#else
         if (g_kv_fp8) {
+#endif  // STRATA_USE_HIP
             k::attn_multi_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, T, c.H, c.KV, k0, nk, pos0,
                               qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s,
                               Ly.page_table);
@@ -2449,9 +2498,19 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         }
     } else {
 #if defined(STRATA_USE_HIP)
-        // IK2_HBPF bit 2: one flash pass over the cache (attn_old: the GEMMs + softmax rows below, as before)
-        const bool hb_attn = (g_hbpf & 4) && !g_kv_fp8 && T >= kHbMinT && Ly.kv_cap > 0 &&
+        // IK2_HBPF bit 2: one flash pass over the cache (attn_old: the GEMMs + softmax rows below, as before); with bit 8
+        // over a turbo6 cache too: its keys decoded once into W.kv_k16 / kv_v16, the pass state in W.lg
+        const int t6_pass = g_t6pf_pass > 0 ? g_t6pf_pass : W.kv_tmp_cap / 64 * 64;
+        const bool t6_hb = g_kv_t6 && (g_hbpf & 256) &&
+                           k::hb_attn_t6_plan(T, pos0, window, W.kv_tmp_cap, t6_pass, W.lg_cap) > 0;
+        const bool hb_attn = (g_hbpf & 4) && !g_kv_fp8 && (!g_kv_t6 || t6_hb) && T >= kHbMinT && Ly.kv_cap > 0 &&
                              k::hb_attn_fits(c.H, c.KV, c.D, c.d_rel);
+        static bool t6_said = false;   // (once: a GPU test must not time the old path and call it the new one)
+        if (g_kv_t6 && (g_hbpf & 260) == 260 && !t6_hb && T >= kHbMinT && !t6_said) {
+            t6_said = true;
+            std::fprintf(stderr, "IK2_HBPF bit 8: a turbo6 visit took the old path (T %d, pos0 %d, %s, %d rows, pass %d)\n",
+                         T, pos0, Ly.sliding ? "window" : "full", W.kv_tmp_cap, t6_pass);
+        }
         auto attn_old = [&]() {
 #endif  // STRATA_USE_HIP
         k::to_f16(q_p, (size_t) T * HD, W.x16, g_s);
@@ -2499,11 +2558,27 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             if (W.relb) Tq = std::min(Tq, Work::kRelbRows);
             const int nk_s = pos0 + ts + Tq - k0_s;
             const long long qn = (long long) Tq * nk_s;
+#if defined(STRATA_USE_HIP)
+            // (turbo6 as FP8: its blocks unpacked to FP16 rows a slice at a time, the same GEMMs over them)
+            auto unpack_kv = [&](int k_from, int n) {
+                if (g_kv_t6)
+                    k::unpack_kv_t6_to_f16(Ly.kc6, Ly.vc6, attn_kv_cap, k_from, n, c.KV, W.kv_k16, W.kv_v16, g_s);
+                else
+                    k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, attn_kv_cap, k_from, n, KD, k_inv, v_inv, W.kv_k16,
+                                            W.kv_v16, g_s, Ly.page_table);
+            };
+            if (g_kv_fp8 || g_kv_t6) {
+#else
             if (g_kv_fp8) {
+#endif  // STRATA_USE_HIP
                 for (int k_off = 0; k_off < nk_s; k_off += W.kv_tmp_cap) {
                     const int nk_c = std::min(W.kv_tmp_cap, nk_s - k_off);
+#if defined(STRATA_USE_HIP)
+                    unpack_kv(k0_s + k_off, nk_c);
+#else
                     k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, attn_kv_cap, k0_s + k_off, nk_c, KD, k_inv, v_inv, W.kv_k16,
                                             W.kv_v16, g_s, Ly.page_table);
+#endif  // STRATA_USE_HIP
                     for (int g = 0; g < c.KV; ++g) {
                         const uint16_t* Kp = W.kv_k16 + (size_t) g * c.D;
                         CB(cublasGemmStridedBatchedEx(
@@ -2517,8 +2592,12 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                 for (int k_off = 0; k_off < nk_s; k_off += W.kv_tmp_cap) {
                     const int nk_c = std::min(W.kv_tmp_cap, nk_s - k_off);
                     if (nk_s > W.kv_tmp_cap) {
+#if defined(STRATA_USE_HIP)
+                        unpack_kv(k0_s + k_off, nk_c);
+#else
                         k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, attn_kv_cap, k0_s + k_off, nk_c, KD, k_inv, v_inv,
                                                 W.kv_k16, W.kv_v16, g_s, Ly.page_table);
+#endif  // STRATA_USE_HIP
                     }
                     const float beta = k_off == 0 ? zero : one;
                     for (int g = 0; g < c.KV; ++g) {
@@ -2578,8 +2657,13 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             if (g_hbpf_check) o = hb_host(W.o, T, HD, HD);
             auto run = [&]() {
                 k::to_f16(q_p, (size_t) T * HD, W.x16, g_s);
-                k::hb_attn_prefill(W.x16, r_p, sink_p, Ly.kc, Ly.vc, Ly.kv_cap, T, pos0, window, extent, Ly.rel_proj,
-                                   qk_scale, W.o, g_s);
+                if (g_kv_t6)
+                    k::hb_attn_prefill_t6(W.x16, r_p, sink_p, Ly.kc6, Ly.vc6, attn_kv_cap, T, pos0, window, extent,
+                                          Ly.rel_proj, qk_scale, W.o, W.kv_k16, W.kv_v16, W.kv_tmp_cap, t6_pass, W.lg,
+                                          W.lg_cap, g_s);
+                else
+                    k::hb_attn_prefill(W.x16, r_p, sink_p, Ly.kc, Ly.vc, Ly.kv_cap, T, pos0, window, extent,
+                                       Ly.rel_proj, qk_scale, W.o, g_s);
             };
             run();
             if (g_hbpf_check) {
@@ -3409,6 +3493,26 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int slot = 0) {
 #if defined(STRATA_USE_HIP)
         bool gated = false;   // (IK2_FUSE: the gate rode the attention's combine)
         if (sk(1)) {
+        } else if (g_kv_t6) {   // (no tensor-core reader: the AMD build has none - g_attn_mma 0 - and turbo6 needs it so)
+            // the group-a-block reader (prep + encode, split, combine + gate; set 4: a window visit in one launch;
+            // set 7: the combine skips empty splits) - the same bytes and values; IK2_FUSE_MASK bit 22: the old reader
+            if (!((fm >> 22) & 1) &&
+                k::attn_tok_t6(q_p, Ly.q_clip, W.kconv, W.vconv, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel, c.qk_clip,
+                               c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kc6, Ly.vc6, Ly.kv_cap,
+                               Ly.sliding, Ly.sink16, W.xq, C, W.sink, qk_scale, Ly.rel_proj, extent, window, P, fs(4),
+                               fs(7), W.lg, gate_p, W.o, W.x16, g_s)) {
+                gated = true;
+            } else {
+                static bool said = false;   // (the new reader refused this visit's shapes or pointers: said once)
+                if (!((fm >> 22) & 1) && !said)
+                    said = true, std::fprintf(stderr, "turbo6: attn_tok_t6 refused visit %d - the old reader runs\n", vis);
+                k::prep_qkv_r_t6(q_p, Ly.q_clip, W.kconv, W.vconv, r_p, Ly.r_clip, 1, c.H, c.KV, c.D, c.d_rel,
+                                 c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : W.pos, c.alpha, c.n_floor,
+                                 W.kconv, W.vconv, Ly.kc6, Ly.vc6, Ly.kv_cap, 0, W.pos, q16, Ly.sink16, W.xq, C,
+                                 W.sink, g_s);
+                k::attn_decode_t6(q_p, r_p, W.sink, Ly.kc6, Ly.vc6, Ly.sliding ? Ly.kv_cap : 0, 1, c.H, c.KV, 0, 0, 0,
+                                  W.pos, P, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+            }
         } else if (g_kv_fp8) {
 #else
         if (g_kv_fp8) {
@@ -5909,8 +6013,18 @@ int main(int argc, char** argv) {
         const std::string kv = getenv("IK2_KV");
         if (kv == "f16" || kv == "fp16") g_kv_fp8 = false;
         else if (kv == "fp8" || kv == "e4m3") g_kv_fp8 = true;
+#if defined(STRATA_USE_HIP)
+        else if (kv == "turbo6" || kv == "t6") g_kv_t6 = true;
+        else die("unknown IK2_KV=" + kv + " (expected fp8, f16 or turbo6)");
+#else
         else die("unknown IK2_KV=" + kv + " (expected fp8 or f16)");
+#endif  // STRATA_USE_HIP
     }
+#if defined(STRATA_USE_HIP)
+    // (turbo6: one GPU, the KV in VRAM - the two-GPU splits and the managed pages' moves count FP16 / FP8 rows)
+    if (g_kv_t6 && n_gpu != 1) die("IK2_KV=turbo6: one GPU (--gpus 1)");
+    if (g_kv_t6 && getenv("IK2_KV_MANAGED") && atoi(getenv("IK2_KV_MANAGED"))) die("IK2_KV=turbo6 with IK2_KV_MANAGED");
+#endif  // STRATA_USE_HIP
     if (getenv("IK2_TRACE") && *getenv("IK2_TRACE")) {
         g_trace = std::fopen(getenv("IK2_TRACE"), "wb");
         if (!g_trace) die(std::string("cannot write ") + getenv("IK2_TRACE"));
@@ -6094,9 +6208,11 @@ int main(int argc, char** argv) {
     g_graph = getenv("IK2_GRAPH") ? std::atoi(getenv("IK2_GRAPH")) != 0 : !amd_tuned;
     g_fuse_mask = getenv("IK2_FUSE") && std::atoi(getenv("IK2_FUSE")) ? 0xf : amd_tuned ? 0xf14f : 0;
     if (getenv("IK2_FUSE_MASK")) g_fuse_mask = (int) std::strtol(getenv("IK2_FUSE_MASK"), nullptr, 0);
-    g_hbpf = getenv("IK2_HBPF") ? (int) std::strtol(getenv("IK2_HBPF"), nullptr, 0) : amd_tuned ? 183 : 0;
+    // (gfx1151: 439 = 183 + bit 256, the prefill attention over a turbo6 cache; FP16 / FP8 caches read 183 of it)
+    g_hbpf = getenv("IK2_HBPF") ? (int) std::strtol(getenv("IK2_HBPF"), nullptr, 0) : amd_tuned ? 439 : 0;
     g_hbpf_check = g_hbpf && getenv("IK2_HBPF_CHECK") ? std::atoi(getenv("IK2_HBPF_CHECK")) : 0;
     g_hbpf_probe = g_hbpf && getenv("IK2_HBPF_PROBE") ? std::atoi(getenv("IK2_HBPF_PROBE")) : 0;
+    g_t6pf_pass = getenv("IK2_T6PF_PASS") ? std::atoi(getenv("IK2_T6PF_PASS")) : 0;
     if (getenv("IK2_AB") && std::atoi(getenv("IK2_AB")) > 0 && g_graph) {
         std::printf("IK2_AB: the launches one by one (IK2_GRAPH=0) - a graph would keep its first arm's kernels\n");
         g_graph = false;
@@ -6121,7 +6237,7 @@ int main(int argc, char** argv) {
     // drafter's base logits through mv_q8p_rows over the Q8_0 head (its FP16 copy freed after the fold); unset: as was
     g_dsc = getenv("IK2_DSC") ? (int) std::strtol(getenv("IK2_DSC"), nullptr, 0) : 0;
     if (g_dsc & 1) {
-        if (g_kv_fp8) die("IK2_DSC=1: the exact window reads an FP16 cache (IK2_KV=fp16)");
+        if (g_kv_fp8 || g_kv_t6) die("IK2_DSC=1: the exact window reads an FP16 cache (IK2_KV=fp16)");
         g_block = true;
     }
     {
@@ -6155,10 +6271,11 @@ int main(int argc, char** argv) {
 #if defined(STRATA_USE_HIP)
             const bool grown = (g_memtrim & 2) && !g_kv_managed && !c.sliding[l];   // (backed as the context grows)
             if ((!g_kv_managed || c.sliding[l]) && !grown)
+                kv_b += mult * (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * kv_row_bytes(c.KV, c.D) * 2;
 #else
             if (!g_kv_managed || c.sliding[l])
-#endif  // STRATA_USE_HIP
                 kv_b += mult * (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
+#endif  // STRATA_USE_HIP
         }
         size_t fr0 = 0, tot0 = 0;
         CU(cudaMemGetInfo(&fr0, &tot0));
@@ -6182,7 +6299,11 @@ int main(int argc, char** argv) {
         size_t kv_tok = 0, kv_fixed = 0;   // (the K / V bytes a context position costs, and those that do not grow)
         for (int l = 0; l < c.n_layer; ++l) {
             if (g_kv_managed && !c.sliding[l]) continue;
+#if defined(STRATA_USE_HIP)
+            const size_t visit = (size_t) (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * kv_row_bytes(c.KV, c.D) * 2;
+#else
             const size_t visit = (size_t) (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
+#endif  // STRATA_USE_HIP
             if (c.sliding[l])
                 kv_fixed += (size_t) g_parallel * visit * (size_t) std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock));
             else kv_tok += visit;
@@ -6458,7 +6579,14 @@ int main(int argc, char** argv) {
         Vi.kv_cap = Ly.sliding ? std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock))
                                : (g_parallel > 1 ? g_kv_total_pages * k::kKvPageSize : ctx);
         const size_t kv_rows = Ly.sliding ? (size_t) g_parallel * Vi.kv_cap : (size_t) Vi.kv_cap;
+#if defined(STRATA_USE_HIP)
+        if (g_kv_t6) {
+            Vi.kc6 = kv_alloc<uint8_t>(kv_rows * kv_row_bytes(c.KV, c.D), Ly.sliding);
+            Vi.vc6 = kv_alloc<uint8_t>(kv_rows * kv_row_bytes(c.KV, c.D), Ly.sliding);
+        } else if (g_kv_fp8) {
+#else
         if (g_kv_fp8) {
+#endif  // STRATA_USE_HIP
             Vi.kc8 = kv_alloc<uint8_t>(kv_rows * KD, Ly.sliding);
             Vi.vc8 = kv_alloc<uint8_t>(kv_rows * KD, Ly.sliding);
         } else {
@@ -6495,14 +6623,22 @@ int main(int argc, char** argv) {
         size_t kv_bytes = 0;
         for (const auto& Vi : M.V) {
             const size_t mult = M.L[Vi.l].sliding ? (size_t) g_parallel : 1;
+#if defined(STRATA_USE_HIP)
+            kv_bytes += mult * (size_t) Vi.kv_cap * kv_row_bytes(c.KV, c.D) * 2;
+#else
             kv_bytes += mult * (size_t) Vi.kv_cap * KD * (g_kv_fp8 ? 1 : 2) * 2;
+#endif  // STRATA_USE_HIP
         }
         if (g_parallel > 1)
             std::printf("kv cache: %s (%.2f GiB across %d layer%s, parallel=%d, paged global pool=%d pages x %d)\n",
                         g_kv_fp8 ? "FP8 E4M3" : "FP16", kv_bytes / 1073741824.0, c.n_visit,
                         c.n_pass > 1 ? " visits" : "s", g_parallel, g_kv_total_pages, k::kKvPageSize);
         else
+#if defined(STRATA_USE_HIP)
+            std::printf("kv cache: %s (%.2f GiB across %d layer%s)\n", g_kv_t6 ? "turbo6" : g_kv_fp8 ? "FP8 E4M3" : "FP16",
+#else
             std::printf("kv cache: %s (%.2f GiB across %d layer%s)\n", g_kv_fp8 ? "FP8 E4M3" : "FP16",
+#endif  // STRATA_USE_HIP
                         kv_bytes / 1073741824.0, c.n_visit, c.n_pass > 1 ? " visits" : "s");
 #if defined(STRATA_USE_HIP)
         if (!g_kv_regions.empty()) {
@@ -6818,7 +6954,11 @@ int main(int argc, char** argv) {
         W.relb_ext = std::max(c.extent, c.extent_swa);
         W.relb = work_alloc<float>((size_t)Work::kRelbRows * c.H * W.relb_ext);
     }
+#if defined(STRATA_USE_HIP)
+    if ((g_kv_fp8 || g_kv_t6) && !(flash_only && g_fast_want)) {
+#else
     if (g_kv_fp8 && !(flash_only && g_fast_want)) {
+#endif  // STRATA_USE_HIP
         W.kv_tmp_cap = std::min(ctx, 32768);
         W.kv_k16 = work_alloc<uint16_t>((size_t)W.kv_tmp_cap * KD);
         W.kv_v16 = work_alloc<uint16_t>((size_t)W.kv_tmp_cap * KD);
@@ -7966,8 +8106,13 @@ int main(int argc, char** argv) {
             std::vector<std::vector<uint8_t>> kv_k, kv_v;
 #endif  // STRATA_USE_HIP
         };
+#if defined(STRATA_USE_HIP)
+        const size_t kv_row_b = kv_row_bytes(c.KV, c.D);   // (a token's K or V row)
+        std::vector<Snap> snaps(8);
+#else
         const size_t kv_elem_b = g_kv_fp8 ? 1 : 2;
         std::vector<Snap> snaps(8);
+#endif  // STRATA_USE_HIP
         for (auto& sn : snaps) {
             sn.kv_k.resize(M.V.size());
             sn.kv_v.resize(M.V.size());
@@ -7977,11 +8122,12 @@ int main(int argc, char** argv) {
                 const size_t cc[4] = {KD, KD, C, C};
                 for (int i = 0; i < 4; ++i) sn.h.push_back(dalloc<float>(3 * cc[i]));
                 if (Ly.sliding && Ly.kv_cap < ctx) {
-                    const size_t bytes = (size_t) c.window * KD * kv_elem_b;
 #if defined(STRATA_USE_HIP)
+                    const size_t bytes = (size_t) c.window * kv_row_b;
                     sn.kv_k[l].reset((g_memtrim & 0x10) ? new uint8_t[bytes] : new uint8_t[bytes]());
                     sn.kv_v[l].reset((g_memtrim & 0x10) ? new uint8_t[bytes] : new uint8_t[bytes]());
 #else
+                    const size_t bytes = (size_t) c.window * KD * kv_elem_b;
                     sn.kv_k[l].resize(bytes);
                     sn.kv_v[l].resize(bytes);
 #endif  // STRATA_USE_HIP
@@ -7992,7 +8138,11 @@ int main(int argc, char** argv) {
         auto snap_copy = [&](Snap& sn, bool save) {
             const size_t cc[4] = {KD, KD, C, C};
             const cudaMemcpyKind kv_dir = save ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
+#if defined(STRATA_USE_HIP)
+            const size_t row_b = kv_row_b;
+#else
             const size_t row_b = (size_t) KD * kv_elem_b;
+#endif  // STRATA_USE_HIP
             for (size_t l = 0; l < M.V.size(); ++l) {   // (l: a visit)
                 Layer& Ly = bind_visit(M, (int) l);
                 use_dev(Ly.dev);
@@ -8007,12 +8157,14 @@ int main(int argc, char** argv) {
                     const int s0 = k_start % Ly.kv_cap;
                     const int n1 = std::min(w, Ly.kv_cap - s0);
                     const int n2 = w - n1;
-                    uint8_t* dk = g_kv_fp8 ? Ly.kc8 : (uint8_t*) Ly.kc;
-                    uint8_t* dv = g_kv_fp8 ? Ly.vc8 : (uint8_t*) Ly.vc;
 #if defined(STRATA_USE_HIP)
+                    uint8_t* dk = g_kv_t6 ? Ly.kc6 : g_kv_fp8 ? Ly.kc8 : (uint8_t*) Ly.kc;
+                    uint8_t* dv = g_kv_t6 ? Ly.vc6 : g_kv_fp8 ? Ly.vc8 : (uint8_t*) Ly.vc;
                     uint8_t* hk = sn.kv_k[l].get();
                     uint8_t* hv = sn.kv_v[l].get();
 #else
+                    uint8_t* dk = g_kv_fp8 ? Ly.kc8 : (uint8_t*) Ly.kc;
+                    uint8_t* dv = g_kv_fp8 ? Ly.vc8 : (uint8_t*) Ly.vc;
                     uint8_t* hk = sn.kv_k[l].data();
                     uint8_t* hv = sn.kv_v[l].data();
 #endif  // STRATA_USE_HIP
@@ -8095,7 +8247,11 @@ int main(int argc, char** argv) {
         auto park_live = [&](const Snap& sn, const Park* keep) {
             const double t0 = now(), G = 1073741824.0;
             const int pos = sn.pos;
+#if defined(STRATA_USE_HIP)
+            const size_t row_b = kv_row_b, cc[4] = {KD, KD, C, C};
+#else
             const size_t row_b = (size_t) KD * kv_elem_b, cc[4] = {KD, KD, C, C};
+#endif  // STRATA_USE_HIP
             size_t need = drafter ? ik2::draft::context_bytes(drafter, pos) : 0;
             for (int v = 0; v < (int) M.V.size(); ++v)
                 need += (size_t) 3 * (2 * KD + 2 * C) * 4 + 2 * (size_t) (ring(v) ? std::min(pos, c.window) : pos) * row_b;
@@ -8162,8 +8318,10 @@ int main(int argc, char** argv) {
                         p->kv_k[v].resize(n);
                         p->kv_v[v].resize(n);
 #if defined(STRATA_USE_HIP)   // (K / V on demand, memtrim 0x02: the rows are hipMemMap'd; one copy may not cross a chunk's reservation: kv_copy)
-                        kv_copy(p->kv_k[v].data(), g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, n, cudaMemcpyDeviceToHost, g_s);
-                        kv_copy(p->kv_v[v].data(), g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, n, cudaMemcpyDeviceToHost, g_s);
+                        kv_copy(p->kv_k[v].data(), g_kv_t6 ? (void*) Ly.kc6 : g_kv_fp8 ? (void*) Ly.kc8
+                                                   : (void*) Ly.kc, n, cudaMemcpyDeviceToHost, g_s);
+                        kv_copy(p->kv_v[v].data(), g_kv_t6 ? (void*) Ly.vc6 : g_kv_fp8 ? (void*) Ly.vc8
+                                                   : (void*) Ly.vc, n, cudaMemcpyDeviceToHost, g_s);
 #else
                         CU(cudaMemcpyAsync(p->kv_k[v].data(), g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, n, cudaMemcpyDefault, g_s));
                         CU(cudaMemcpyAsync(p->kv_v[v].data(), g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, n, cudaMemcpyDefault, g_s));
@@ -8188,7 +8346,11 @@ int main(int argc, char** argv) {
         auto park_restore = [&](Park& p) {
             const double t0 = now();
             const int pos = (int) p.ids.size();
+#if defined(STRATA_USE_HIP)
+            const size_t row_b = kv_row_b, cc[4] = {KD, KD, C, C};
+#else
             const size_t row_b = (size_t) KD * kv_elem_b, cc[4] = {KD, KD, C, C};
+#endif  // STRATA_USE_HIP
             for (auto& sn : snaps) sn.pos = -1;   // (they were the other conversation's)
             Snap& sn = snaps[snap_next];
             snap_next = (snap_next + 1) % (int) snaps.size();
@@ -8208,8 +8370,10 @@ int main(int argc, char** argv) {
                 } else {
                     const size_t n = (size_t) pos * row_b;
 #if defined(STRATA_USE_HIP)   // (K / V on demand, memtrim 0x02: the rows are hipMemMap'd; one copy may not cross a chunk's reservation: kv_copy)
-                    kv_copy(g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, p.kv_k[v].data(), n, cudaMemcpyHostToDevice, g_s);
-                    kv_copy(g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, p.kv_v[v].data(), n, cudaMemcpyHostToDevice, g_s);
+                    kv_copy(g_kv_t6 ? (void*) Ly.kc6 : g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, p.kv_k[v].data(), n,
+                            cudaMemcpyHostToDevice, g_s);
+                    kv_copy(g_kv_t6 ? (void*) Ly.vc6 : g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, p.kv_v[v].data(), n,
+                            cudaMemcpyHostToDevice, g_s);
 #else
                     CU(cudaMemcpyAsync(g_kv_fp8 ? (void*) Ly.kc8 : (void*) Ly.kc, p.kv_k[v].data(), n, cudaMemcpyDefault, g_s));
                     CU(cudaMemcpyAsync(g_kv_fp8 ? (void*) Ly.vc8 : (void*) Ly.vc, p.kv_v[v].data(), n, cudaMemcpyDefault, g_s));
@@ -8248,7 +8412,12 @@ int main(int argc, char** argv) {
             eos_ids.push_back(199999);   // (Inkling 2's <|endoftext|>)
         }
         if (serve_maya) {
+#if defined(STRATA_USE_HIP)
+            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d resident=%d\n",
+                        g_kv_t6 ? "turbo6" : g_kv_fp8 ? "fp8" : "f16", ctx, n_gpu, g_fast ? 1 : 0);
+#else
             std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d resident=%d\n", g_kv_fp8 ? "fp8" : "f16", ctx, n_gpu, g_fast ? 1 : 0);
+#endif  // STRATA_USE_HIP
             std::printf("READY %d stop\n", ctx);
         } else {
             std::printf("@READY ctx %d\n", ctx);
