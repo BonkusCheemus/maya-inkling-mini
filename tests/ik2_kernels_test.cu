@@ -2959,10 +2959,12 @@ void test_turbo6() {
             uint16_t *k16 = dev_n<uint16_t>((size_t) un * KD), *v16 = dev_n<uint16_t>((size_t) un * KD);
             k::unpack_kv_t6_to_f16(dk, dv, 0, u0, un, KV, k16, v16, 0);
             const auto hk = host(k16, (size_t) un * KD), hv = host(v16, (size_t) un * KD);
+            // equal bits, or both zero: the kernel writes +0 for a -0 product (its v_fma_mix adds +0), values IEEE-equal
+            auto same = [](uint16_t a, uint16_t b) { return a == b || ((a | b) & 0x7fff) == 0; };
             size_t bad = 0;
             for (size_t i = 0; i < (size_t) un * KD; ++i)
-                bad += hk[i] != f2h_host(kf[(size_t) u0 * KD + i]) || hv[i] != f2h_host(vf[(size_t) u0 * KD + i]);
-            expect_true("turbo6 unpack = the CPU decode rounded to FP16", bad == 0);
+                bad += !same(hk[i], f2h_host(kf[(size_t) u0 * KD + i])) || !same(hv[i], f2h_host(vf[(size_t) u0 * KD + i]));
+            expect_true("turbo6 unpack = the CPU decode rounded to FP16 (+0 = -0)", bad == 0);
             cudaFree(k16), cudaFree(v16);
         }
         auto q = fvec((size_t) H * 128, 3.0f), r = fvec((size_t) H * d_rel, 2.0f), sink = fvec(H, 3.0f),
