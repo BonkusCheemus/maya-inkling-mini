@@ -12,6 +12,8 @@
 #include <cstring>
 #if defined(STRATA_USE_HIP)
 #include <utility>
+
+#include "ik2_turbo6.h"   // (IK2_KV=turbo6: the block format, host + device)
 #endif  // STRATA_USE_HIP
 
 namespace ik2::k {
@@ -352,6 +354,19 @@ __device__ __forceinline__ void store_v_warp(const float* vp, uint16_t* vdst, in
 __device__ __forceinline__ void store_v_warp(const float* vp, uint8_t* vdst, int D, float eps, float v_scale) {
     rms_fp8_warp(vp, vdst, D, eps, v_scale);
 }
+#if defined(STRATA_USE_HIP)
+// (IK2_KV=turbo6: the clipped k and the normed v in F32 to a staging row - ik2_turbo6.inc encodes them)
+__device__ __forceinline__ void store_k_warp(const float* kp, float* kdst, int D, float qk_clip, float) {
+    l2clip_warp(kp, nullptr, kdst, nullptr, D, qk_clip, 1.0f);
+}
+__device__ __forceinline__ void store_v_warp(const float* vp, float* vdst, int D, float eps, float) {
+    const int lane = threadIdx.x & 31;
+    float a = 0.0f;
+    for (int d = lane; d < D; d += 32) a += vp[d] * vp[d];
+    const float rs = rsqrtf(wsum(a) / (float) D + eps);
+    for (int d = lane; d < D; d += 32) vdst[d] = vp[d] * rs;
+}
+#endif  // STRATA_USE_HIP
 
 __device__ __forceinline__ int kv_row_index(int pos, int kv_cap, const int* page_table) {
     if (page_table) {
@@ -6821,6 +6836,7 @@ void attn_slots_f16(const uint16_t*, const float*, int, const float*, const uint
 #include "ik2_fuse.inc"      // IK2_FUSE_MASK: the resident decode's small kernels, fewer and shorter
 #include "ik2_experts2.inc"  // IK2_FUSE_MASK 0x1000..0x8000: batch-1 expert GEMVs, x in registers
 #include "ik2_hbpf.inc"      // IK2_HBPF: prefill kernels ported from headbouyJB/inkling2-gufo (MIT)
+#include "ik2_turbo6.inc"    // IK2_KV=turbo6: the KV write, the token path's reader, the prompt path's unpack
 #include "ik2_dsc.inc"       // IK2_DSC: the exact verify window of --draft
 #endif  // STRATA_USE_HIP
 }  // namespace ik2::k

@@ -664,6 +664,45 @@ bool hb_attn_fits(int H, int KV, int D, int d_rel);
 void hb_attn_prefill(const uint16_t* q16, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                      int cap, int T, int pos0, int window, int extent, const float* rel, float qk_scale, float* out,
                      cudaStream_t s);
+/// bit 8 (with bit 2): the same over a turbo6 cache (kc6 / vc6, ring kv_cap as unpack_kv_t6_to_f16;
+/// window (1 << 30) = a full visit): its keys decoded once to FP16 rows k16 / v16 [rows][KV * 128] (unpack_kv_t6_to_f16's
+/// values), then hb_attn_prefill over them - or, a full visit of more than `pass` keys (a multiple of 64, <= rows), in
+/// passes with the softmax state in st (st_floats >= T x 24 x 132), the one call's bits.  hb_attn_t6_plan: 1 one call,
+/// n passes, 0 cannot (the caller's old path; hb_attn_prefill_t6 aborts on it)
+int hb_attn_t6_plan(int T, int pos0, int window, int rows, int pass, size_t st_floats);
+void hb_attn_prefill_t6(const uint16_t* q16, const float* r, const float* sink, const uint8_t* kc6, const uint8_t* vc6,
+                        int kv_cap, int T, int pos0, int window, int extent, const float* rel, float qk_scale,
+                        float* out, uint16_t* k16, uint16_t* v16, int rows, int pass, float* st, size_t st_floats,
+                        cudaStream_t s);
+/// IK2_KV=turbo6 (ik2_turbo6.h / .inc; tubo's 98-byte block, one a 128-value head): caches [kv_cap][KV][98] bytes.
+/// kv_t6_encode: F32 rows k32 / v32 [T][KV][128] -> the blocks at slot (pos + t) % kv_cap (kv_cap 0: pos + t), pos =
+/// *pos_d if given else pos0 - the bytes of ik2::t6::QuantizeBlock.  prep_qkv_r_t6: prep_qkv_r_f16's work (q, r clips,
+/// sinks) with k and v staged in F32 (k_stage, v_stage [T][KV][128]), then kv_t6_encode.  attn_decode_t6: attn_multi /
+/// attn_decode_f16_at over turbo6 caches (pos_d: the replayed graph's position; P splits; scratch nq H P 130 floats).
+/// unpack_kv_t6_to_f16: positions k0 .. k0 + nk - 1 -> FP16 [nk][KV * 128] (the prompt path's GEMMs).
+void kv_t6_encode(const float* k32, const float* v32, uint8_t* kc, uint8_t* vc, int T, int KV, int kv_cap, int pos0,
+                  const int* pos_d, cudaStream_t s);
+void prep_qkv_r_t6(float* q, const float* q_clip, const float* k_in, const float* v_in, float* r, const float* r_clip,
+                   int T, int H, int KV, int D, int d_rel, float qk_clip, float rel_clip, float eps, const int* pos,
+                   float alpha, float n_floor, float* k_stage, float* v_stage, uint8_t* kc, uint8_t* vc, int kv_cap,
+                   int pos0, const int* pos0_d, uint16_t* q16, const uint16_t* sink_w, const float* sink_x,
+                   int sink_k, float* sink_y, cudaStream_t s);
+void attn_decode_t6(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc, int kv_cap,
+                    int nq, int H, int Hkv, int k0, int nk, int qpos0, const int* pos_d, int P, float qk_scale,
+                    const float* proj, int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s);
+void unpack_kv_t6_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk, int Hkv, uint16_t* k16,
+                         uint16_t* v16, cudaStream_t s);
+/// attn_tok_t6: one token's prep_qkv_r_t6 + attn_decode_t6 + gate_mul_f16 (the position at pos; out = o sigmoid(gate),
+/// out16 its FP16), the same bytes and values, a group a block: one_launch (P 16, a window layer) all of it in one
+/// launch, else prep + split + combine (skip: set 7's combine).  q is left rotated (prep), r clipped; scratch H P 130
+/// floats.  false (nothing launched): a shape it does not take (3 q heads a group, D 128, d_rel <= 32, sinks of
+/// C = 2304, P 16 / 128, 16-byte rows) - the caller takes the two calls above.
+bool attn_tok_t6(float* q, const float* q_clip, const float* k_in, const float* v_in, float* r, const float* r_clip,
+                 int H, int KV, int D, int d_rel, float qk_clip, float rel_clip, float eps, const int* pos,
+                 bool log_scale, float alpha, float n_floor, uint8_t* kc, uint8_t* vc, int kv_cap, bool sliding,
+                 const uint16_t* sink_w, const float* sink_x, int sink_k, float* sink_y, float qk_scale,
+                 const float* proj, int extent, int window, int P, bool one_launch, bool skip, float* scratch,
+                 const float* gate, float* out, uint16_t* out16, cudaStream_t s);
 /// bit 4 (ours): up to 3 loop gates over a chunk, each one kernel: y = (1 - tanh(F g)) x + tanh(G g) m with
 /// g = D [rms(x); rms(m)] (eps_gate), then y16 = rms(y) * w (eps_norm) F16, y32 the same F32 when not null; x, m
 /// [T][C] F32 (y32 may be x: a block reads its own rows before it writes them; n 1 then), D [R][2C], F (forget),

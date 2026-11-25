@@ -522,7 +522,13 @@ struct PfArgs {
     const float* sink;   // [U][NH]
     const float* rel;    // F32 [extent][RD]
     float* out;          // [U][NH][HD]
+    // PASS only (hb_attn_prefill_t6): the keys [klo, khi) - on a full visit tiles start at key 0, so
+    // a boundary at a multiple of PF_KT is a tile boundary of the single call -, the online softmax state st
+    // [U][NH][kPfSt] (acc [HD], m, l of half 0, l of half 1) read first when st_in, written in place of out when st_out
+    int klo, khi, st_in, st_out;
+    float* st;
 };
+constexpr int kPfSt = HD + 4;
 __device__ __forceinline__ v16h cat16(uint4 a, uint4 b) {
     union { uint4 u[2]; v16h v; } x;
     x.u[0] = a;
@@ -534,8 +540,10 @@ __device__ __forceinline__ v2h as_v2h(uint32_t u) { return __builtin_bit_cast(v2
 
 // A block: NTT x 16 queries x the 3 q-heads of one kv-head (blockIdx.y), 12 waves (NTT 4); 64-key K and transposed
 // V tiles in LDS; S^T = K Q^T on WMMA, online softmax in registers (initial state = the sink: m = sink, l = 1), P
-// repacked into a WMMA operand by one shfl_xor 16, PV a second WMMA.
-template <int NTT>
+// repacked into a WMMA operand by one shfl_xor 16, PV a second WMMA.  PASS: a pass of a full visit
+// (PfArgs klo .. st); the same tiles, in the same order, as the single call's that fall in [klo, khi), the state
+// between passes in F32: the single call's bits.  PASS false: the code as before (bit 2's FP16 call).
+template <int NTT, bool PASS = false>
 __global__ __launch_bounds__(NTT * 96) void attn_prefill(PfArgs a) {
     constexpr int NT = NTT * 96;
     __shared__ __attribute__((aligned(16))) __half sK[PF_KT][PF_KS];
@@ -571,11 +579,23 @@ __global__ __launch_bounds__(NTT * 96) void attn_prefill(PfArgs a) {
     v8f acc[8];
 #pragma unroll
     for (int d = 0; d < 8; d++) acc[d] = (v8f){0, 0, 0, 0, 0, 0, 0, 0};
+    if constexpr (PASS) {
+        if (a.st_in && rowvalid) {   // (where the previous pass stopped; m is the same in both halves)
+            const float* sp = a.st + ((size_t) t * NH + h) * kPfSt;
+#pragma unroll
+            for (int dt = 0; dt < 8; dt++)
+#pragma unroll
+                for (int i = 0; i < 8; i++) acc[dt][i] = sp[dt * 16 + 2 * i + half];
+            m = sp[HD];
+            l = sp[HD + 1 + half];
+        }
+    }
 
     const int pfirst = a.p0 + tbase;
     const int plast = min(a.p0 + a.U - 1, a.p0 + tbase + 16 * NTT - 1);
-    const int kfirst = max(0, pfirst - (a.window - 1));
-    const int ntiles = (plast - kfirst + PF_KT) / PF_KT;
+    int kfirst = max(0, pfirst - (a.window - 1)), kend = plast;   // (kend: the last key a tile loads)
+    if constexpr (PASS) kfirst = max(kfirst, a.klo), kend = min(kend, a.khi - 1);
+    const int ntiles = (kend - kfirst + PF_KT) / PF_KT;
     const int wmin = a.p0 + tb, wmax = a.p0 + tb + 15;
 
     for (int tile = 0; tile < ntiles; tile++) {
@@ -583,12 +603,12 @@ __global__ __launch_bounds__(NTT * 96) void attn_prefill(PfArgs a) {
         __syncthreads();
         for (int idx = tid; idx < PF_KT * 16; idx += NT) {
             const int key = idx >> 4, c = idx & 15;
-            const int pos = min(kbase + key, plast);
+            const int pos = min(kbase + key, kend);
             *(uint4*) &sK[key][c * 8] = *(const uint4*) (a.kc + (size_t) (pos % a.cap) * CELL + kvh * HD + c * 8);
         }
         for (int idx = tid; idx < (PF_KT / 2) * 16; idx += NT) {
             const int kp = idx >> 4, c = idx & 15;
-            const int p0_ = min(kbase + 2 * kp, plast), p1_ = min(kbase + 2 * kp + 1, plast);
+            const int p0_ = min(kbase + 2 * kp, kend), p1_ = min(kbase + 2 * kp + 1, kend);
             uint4 v0 = *(const uint4*) (a.vc + (size_t) (p0_ % a.cap) * CELL + kvh * HD + c * 8);
             uint4 v1 = *(const uint4*) (a.vc + (size_t) (p1_ % a.cap) * CELL + kvh * HD + c * 8);
             uint32_t* dst = (uint32_t*) &sVt[c * 8][2 * kp];
@@ -673,6 +693,18 @@ __global__ __launch_bounds__(NTT * 96) void attn_prefill(PfArgs a) {
         }
     }
     if (!rowvalid) return;
+    if constexpr (PASS) {
+        if (a.st_out) {   // (the next pass goes on from here)
+            float* sp = a.st + ((size_t) t * NH + h) * kPfSt;
+#pragma unroll
+            for (int dt = 0; dt < 8; dt++)
+#pragma unroll
+                for (int i = 0; i < 8; i++) sp[dt * 16 + 2 * i + half] = acc[dt][i];
+            if (half == 0) sp[HD] = m;
+            sp[HD + 1 + half] = l;
+            return;
+        }
+    }
     const float inv = 1.0f / (l + __shfl_xor(l, 16, 32));
     float* op = a.out + ((size_t) t * NH + h) * HD;
 #pragma unroll
@@ -953,4 +985,63 @@ void hb_attn_prefill(const uint16_t* q16, const float* r, const float* sink, con
     a.out = out;
     hb::attn_prefill<4><<<dim3((unsigned) ((T + 63) / 64), hb::NKV), 384, 0, s>>>(a);
     check("hb_attn_prefill");
+}
+
+// IK2_HBPF bit 8 (with bit 2): attn_prefill over a turbo6 cache.  The keys
+// [k0, pos0 + T) (k0 the window's first, 0 on a full visit) decoded ONCE by unpack_kv_t6_to_f16 - the old path's own
+// FP16 values (the CPU decode rounded: test_turbo6) - into k16 / v16 at row pos % rows, then the FP16 kernel over them:
+// bit 2's arithmetic on those values.  A full visit of more than `pass` keys: passes of `pass` keys (row pos - lo), the
+// online softmax state in st [T][NH][kPfSt] F32 between them - the single call's tiles, so its bits.
+// plan: 1 one call, n > 1 that many passes, 0 neither (a window's keys past the rows, or no room: the old path).
+int hb_attn_t6_plan(int T, int pos0, int window, int rows, int pass, size_t st_floats) {
+    const bool full = window >= (1 << 30);
+    const int k0 = full ? 0 : std::max(0, pos0 - window + 1), span = pos0 + T - k0;
+    if (rows <= 0 || T <= 0) return 0;
+    if (!full) return span <= rows ? 1 : 0;   // (passes need tiles from key 0: a window's start per block is not)
+    if (span <= std::min(pass, rows)) return 1;
+    if (pass < hb::PF_KT || pass % hb::PF_KT || pass > rows || (size_t) T * hb::NH * hb::kPfSt > st_floats) return 0;
+    return (span + pass - 1) / pass;
+}
+void hb_attn_prefill_t6(const uint16_t* q16, const float* r, const float* sink, const uint8_t* kc6, const uint8_t* vc6,
+                        int kv_cap, int T, int pos0, int window, int extent, const float* rel, float qk_scale,
+                        float* out, uint16_t* k16, uint16_t* v16, int rows, int pass, float* st, size_t st_floats,
+                        cudaStream_t s) {
+    const int n = hb_attn_t6_plan(T, pos0, window, rows, pass, st_floats);
+    const int hi = pos0 + T, k0 = window >= (1 << 30) ? 0 : std::max(0, pos0 - window + 1);
+    if (!n) {
+        std::fprintf(stderr, "ik2::k::hb_attn_prefill_t6: keys %d .. %d, %d rows, pass %d: no plan\n", k0, hi, rows, pass);
+        std::abort();
+    }
+    if (n == 1) {   // (row pos % rows: two pieces at most)
+        for (int p = k0; p < hi;) {
+            const int row = p % rows, m = std::min(hi - p, rows - row);
+            unpack_kv_t6_to_f16(kc6, vc6, kv_cap, p, m, hb::NKV, k16 + (size_t) row * hb::CELL,
+                                v16 + (size_t) row * hb::CELL, s);
+            p += m;
+        }
+        hb_attn_prefill(q16, r, sink, k16, v16, rows, T, pos0, window, extent, rel, qk_scale, out, s);
+        return;
+    }
+    hb::PfArgs a{};
+    a.kc = (const __half*) k16;
+    a.vc = (const __half*) v16;
+    a.cap = pass;   // (lo is a multiple of pass: row pos % pass = pos - lo)
+    a.window = window;
+    a.extent = extent;
+    a.U = T;
+    a.p0 = pos0;
+    a.qk_scale = qk_scale;
+    a.q16 = (const __half*) q16;
+    a.r = r;
+    a.sink = sink;
+    a.rel = rel;
+    a.out = out;
+    a.st = st;
+    for (int lo = 0; lo < hi; lo += pass) {
+        const int m = std::min(pass, hi - lo);
+        unpack_kv_t6_to_f16(kc6, vc6, kv_cap, lo, m, hb::NKV, k16, v16, s);
+        a.klo = lo, a.khi = lo + m, a.st_in = lo > 0, a.st_out = lo + m < hi;
+        hb::attn_prefill<4, true><<<dim3((unsigned) ((T + 63) / 64), hb::NKV), 384, 0, s>>>(a);
+        check("hb_attn_prefill_t6");
+    }
 }
