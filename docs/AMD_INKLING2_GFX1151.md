@@ -77,6 +77,10 @@ IK2_HBPF=0 IK2_MEMTRIM=0`). Two runs each (night, idle / day, desktop in use):
 Prefill answers: KL divergence against an fp64 reference (4096-token prompt, last 512 positions) 2.764e-3 with
 `IK2_HBPF=183` vs 2.913e-3 on the old path; paired difference -1.5e-4, SE 2.0e-4.
 
+turbo6 KV (`IK2_KV=turbo6`), the same measurement on this branch's defaults, one run each, laptop warm: decode 44.5
+tok/s (45.6 with FP16 KV), prefill 2048 1,356 tok/s (1,219), prefill 8192 1,275 tok/s (1,237). Single runs: the
+prefill gap is within run-to-run noise here.
+
 ## Credits and third-party code
 
 - `src/ik2/ik2_hbpf.inc` ports prefill kernels from **headbouyJB/inkling2-gufo** (commit 8bb6cd5, `src/hip/fast.hip`):
