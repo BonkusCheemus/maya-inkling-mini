@@ -28,7 +28,19 @@ device keeps the plain path unless the settings ask; the prefill kernels (`IK2_H
 
 ## Measured
 
-TODO (the GPU run of probes/pr_gpu.sh fills this table: `--bench` format, main's AMD build vs this branch).
+`--bench`'s measurement (3 questions x 256 tokens, greedy, thinking off, one warm-up; prefill at 2048 / 8192), driven
+over `--serve`, context 16,384, `Inkling-2-Mini-UD-Q4_K_XL.gguf`, gfx1151 (Radeon 8060S, 32 GB shared), ROCm 7.2.4.
+`main` does not build on AMD, so "before" is this branch with every tuned path off (`IK2_FUSE_MASK=0 IK2_GRAPH=1
+IK2_HBPF=0 IK2_MEMTRIM=0`). Two runs each (night, idle / day, desktop in use):
+
+| | before (tuned paths off) | after (defaults) |
+| --- | --- | --- |
+| decode, mean of 3 | 38.7 / 39.9 tok/s | 46.2 / 46.2 tok/s |
+| prefill 2048 | 243 / 314 tok/s | 1,356 / 1,616 tok/s |
+| prefill 8192 | 232 / 299 tok/s | 1,357 / 1,506 tok/s |
+
+Prefill answers: KL divergence against an fp64 reference (4096-token prompt, last 512 positions) 2.764e-3 with
+`IK2_HBPF=183` vs 2.913e-3 on the old path; paired difference -1.5e-4, SE 2.0e-4.
 
 ## Credits and third-party code
 
